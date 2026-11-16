@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Build & Binaries
+SpotifyLyrics
+*.o
+*.dSYM/
+build/
+DerivedData/
+
+# Logs & Temporary
+*.log
+.mimosa/

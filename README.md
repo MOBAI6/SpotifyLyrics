@@ -1,0 +1,69 @@
+# SpotifyLyrics (macOS)
+
+<p align="center">
+  <b>极简 · 流体 · 零性能抖动的原生 macOS Spotify 桌面歌词浮窗助手</b><br>
+  <i>A lightweight, fluid, and battery-friendly floating lyrics assistant for Spotify on macOS.</i>
+</p>
+
+---
+
+## 🌟 特性亮点 (Features)
+
+- 🎵 **三源级联与双级高速缓存**
+  - 网易云音乐 + QQ音乐 + LRCLIB 三源级联检索，支持繁简双向自动转换与元数据清洗（去除 Remastered、Live、feat. 等干扰词）。
+  - **L1 内存缓存 + L2 磁盘永久缓存**（SHA256 规范化索引），切歌 0ms 瞬开，断网亦可离线加载；支持 24 小时负缓存防重复打扰，支持状态栏一键清除。
+- 🌊 **Apple Music 级流体连续平滑换行**
+  - 基于全局连续行序号与弹性阻尼曲线（Spring Physics: `response: 0.36s, dampingFraction: 0.86`）驱动垂直平滑推移，告别生硬的原地文字突变。
+- 👥 **智能对唱角色左右分栏**
+  - 自动识别男声 / 女声 / 合唱及多歌手声部，男声居左、女声居右、合唱与独唱居中，自动剥离多余括号前缀，排版纯净优雅。
+- 🪟 **系统级桌面高斯毛玻璃穿透**
+  - 封装 AppKit 原生 `NSVisualEffectView`（`blendingMode = .behindWindow`），实时高斯散焦模糊桌面壁纸；提供一键切换极致节能背景。
+- 🎨 **全场景自适应对比度与多套视觉主题**
+  - 双层物理微光影托底（1.5px 抗浅底微暗轮廓），在雪白网页与深黑桌面下均保持极致可读性；
+  - 内置 3 套氛围配色：**经典 Apple Music (流光纯白)**、**极光霓虹 (Aurora Cyber)**、**暖玉琥珀 (Warm Amber)**，状态栏随时切换。
+- ⚡️ **极致轻量与零性能抖动**
+  - 剔除昂贵的动态文字实时高斯模糊，改用纯 GPU 硬件零成本的透明度与缩放阶梯；
+  - 仅切片渲染当前视口 7~9 行，削减 90% GPU 开销；
+  - 由系统分布式通知优先被动驱动，**稳态 CPU 占用仅 0.0% ~ 0.1%，暂停彻底静默，物理内存仅 ~37 MB**。
+- 🖱 **交互体验**
+  - **点击歌词跳转进度 (Click-to-Seek)**：单击任意行秒级定位 Spotify 播放进度；
+  - **双击折叠胶囊**：双击空白处一秒在 56px 迷你单行胶囊与多行展开画卷间平滑切换；
+  - **鼠标穿透模式 (`⌘P`)**：随时开关点击穿透，浮于任何 IDE 或浏览器之上不遮挡任何鼠标点击；
+  - **悬停控制条**：鼠标划过底部自动升起半透明迷你上一首/播放暂停/下一首控制器。
+
+---
+
+## 🛠 快速开始与构建 (Build & Run)
+
+### 环境要求
+- macOS 12.0 (Monterey) 或更高版本
+- Xcode 命令行工具 (`xcode-select --install`)
+- Spotify macOS 桌面客户端
+
+### 一键构建与安装
+```bash
+git clone https://github.com/MOBAI6/SpotifyLyrics.git
+cd SpotifyLyrics
+chmod +x build.sh
+./build.sh
+```
+构建完成后，App 将自动打包并签名安装至 `/Applications/SpotifyLyrics.app`。
+
+---
+
+## ⌨️ 快捷操作指南
+
+| 操作 | 对应效果 |
+| :--- | :--- |
+| **单击歌词行** | Spotify 进度立即跳转到该时刻 (Click-to-Seek) |
+| **双击窗口空白处** | 在 56px 迷你单行胶囊模式与多行画卷展开模式间一秒切换 |
+| **快捷键 `⌘P`** | 开关鼠标点击穿透模式 (穿透时鼠标点击直达底层窗口) |
+| **快捷键 `⌘H`** | 隐藏 / 呼出桌面歌词浮窗 |
+| **快捷键 `⌘R`** | 强制重新检索并拉取当前曲目歌词 |
+| **状态栏菜单** | 切换字体颜色主题 / 一键清空歌词缓存 / 开关节能背景 / 重置位置居中 |
+
+---
+
+## 📄 开源许可证 (License)
+
+本项目采用 [MIT License](LICENSE) 许可协议。
