@@ -184,11 +184,15 @@ class RobustLyricsCache {
 
         if let mem = memCache.object(forKey: nsKey) {
             let str = mem as String
-            return str == "[EMPTY]" ? nil : str
+            return (str == "[EMPTY]" || isInvalidLyricContent(str)) ? nil : str
         }
 
         let file = cacheDir.appendingPathComponent("\(key).lrc")
         if let diskStr = try? String(contentsOf: file, encoding: .utf8) {
+            if isInvalidLyricContent(diskStr) {
+                try? FileManager.default.removeItem(at: file)
+                return nil
+            }
             memCache.setObject(diskStr as NSString, forKey: nsKey)
             return diskStr == "[EMPTY]" ? nil : diskStr
         }
@@ -210,6 +214,9 @@ class RobustLyricsCache {
     }
 
     func set(artist: String, title: String, lyric: String) {
+        if isInvalidLyricContent(lyric) {
+            return
+        }
         let key = shaKey(artist: artist, title: title)
         let nsKey = key as NSString
         memCache.setObject(lyric as NSString, forKey: nsKey)
@@ -237,9 +244,23 @@ class RobustLyricsCache {
         let files = (try? FileManager.default.contentsOfDirectory(atPath: cacheDir.path)) ?? []
         return files.filter { $0.hasSuffix(".lrc") }.count
     }
+
+    // 校验歌词质量：过滤伴奏/纯音乐/假歌词
+    func isInvalidLyricContent(_ lrc: String) -> Bool {
+        if lrc.contains("纯音乐，请欣赏") || lrc.contains("纯音乐") || lrc.contains("没有填词") {
+            let lines = lrc.components(separatedBy: .newlines).filter { line in
+                let t = line.trimmingCharacters(in: .whitespaces)
+                return t.contains("]") && !t.contains("作词") && !t.contains("作曲") && !t.contains("编曲")
+            }
+            if lines.count <= 3 {
+                return true
+            }
+        }
+        return false
+    }
 }
 
-// MARK: - 5. 三源级联检索引擎 (网易云 + QQ音乐 + LRCLIB)
+// MARK: - 5. 增强型三源级联检索引擎 (防串曲、防伴奏、防翻唱多维评分系统)
 class LyricsEngine {
     static let shared = LyricsEngine()
 
@@ -264,10 +285,10 @@ class LyricsEngine {
         let simpT = toSimplified(cleanT)
         let simpA = toSimplified(cleanA)
 
-        // 第一源：网易云
-        fetchFromNetease(query: "\(simpT) \(simpA)", spotifySec: spotifySec) { [weak self] lrc1 in
+        // 第一源：网易云多维打分
+        fetchFromNetease(rawTitle: cleanT, rawArtist: cleanA, simpTitle: simpT, simpArtist: simpA, spotifySec: spotifySec) { [weak self] lrc1 in
             guard let self = self else { return }
-            if let lrc = lrc1 {
+            if let lrc = lrc1, !RobustLyricsCache.shared.isInvalidLyricContent(lrc) {
                 let lines = self.parseLRC(lrc, artist: artist)
                 if !lines.isEmpty {
                     RobustLyricsCache.shared.set(artist: artist, title: title, lyric: lrc)
@@ -276,10 +297,10 @@ class LyricsEngine {
                 }
             }
 
-            // 第二源：QQ音乐
-            self.fetchFromQQMusic(query: "\(simpT) \(simpA)", spotifySec: spotifySec) { [weak self] lrc2 in
+            // 第二源：QQ音乐多维打分
+            self.fetchFromQQMusic(rawTitle: cleanT, rawArtist: cleanA, simpTitle: simpT, simpArtist: simpA, spotifySec: spotifySec) { [weak self] lrc2 in
                 guard let self = self else { return }
-                if let lrc = lrc2 {
+                if let lrc = lrc2, !RobustLyricsCache.shared.isInvalidLyricContent(lrc) {
                     let lines = self.parseLRC(lrc, artist: artist)
                     if !lines.isEmpty {
                         RobustLyricsCache.shared.set(artist: artist, title: title, lyric: lrc)
@@ -288,10 +309,10 @@ class LyricsEngine {
                     }
                 }
 
-                // 第三源：LRCLIB
+                // 第三源：LRCLIB 精准匹配
                 self.fetchFromLRCLIB(title: simpT, artist: simpA, spotifySec: spotifySec) { [weak self] lrc3 in
                     guard let self = self else { return }
-                    if let lrc = lrc3 {
+                    if let lrc = lrc3, !RobustLyricsCache.shared.isInvalidLyricContent(lrc) {
                         let lines = self.parseLRC(lrc, artist: artist)
                         if !lines.isEmpty {
                             RobustLyricsCache.shared.set(artist: artist, title: title, lyric: lrc)
@@ -306,9 +327,53 @@ class LyricsEngine {
         }
     }
 
-    private func fetchFromNetease(query: String, spotifySec: Double, completion: @escaping (String?) -> Void) {
+    // 辅助计算曲目匹配置信度评分
+    private func computeConfidenceScore(candTitle: String, candArtist: String, targetTitle: String, targetArtist: String, candDuration: Double, targetDuration: Double) -> Double {
+        var score: Double = 100.0
+
+        let ct = toSimplified(candTitle).lowercased()
+        let ca = toSimplified(candArtist).lowercased()
+        let tt = toSimplified(targetTitle).lowercased()
+        let ta = toSimplified(targetArtist).lowercased()
+
+        // 1. 严格排斥干扰标签（伴奏/纯音乐/翻唱）
+        let negativeKeywords = ["伴奏", "纯音乐", "instrumental", "karaoke", "piano", "cover", "翻唱", "铃声"]
+        for kw in negativeKeywords {
+            if ct.contains(kw) && !tt.contains(kw) {
+                return -999.0 // 直接废弃
+            }
+        }
+
+        // 2. 歌手匹配权重 (最高权重)
+        if ca.contains(ta) || ta.contains(ca) {
+            score += 40.0
+        } else {
+            score -= 50.0 // 歌手对不上，大幅扣分
+        }
+
+        // 3. 歌名匹配
+        if ct == tt {
+            score += 30.0
+        } else if ct.contains(tt) || tt.contains(ct) {
+            score += 15.0
+        } else {
+            score -= 40.0
+        }
+
+        // 4. 时长差异衰减
+        let diff = abs(candDuration - targetDuration)
+        if diff > 15.0 {
+            return -999.0 // 误差超过15秒直接放弃
+        }
+        score -= diff * 3.5
+
+        return score
+    }
+
+    private func fetchFromNetease(rawTitle: String, rawArtist: String, simpTitle: String, simpArtist: String, spotifySec: Double, completion: @escaping (String?) -> Void) {
+        let query = "\(simpTitle) \(simpArtist)"
         guard let encodedQ = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let searchUrl = URL(string: "https://music.163.com/api/search/get/web?s=\(encodedQ)&type=1&limit=5") else {
+              let searchUrl = URL(string: "https://music.163.com/api/search/get/web?s=\(encodedQ)&type=1&limit=8") else {
             completion(nil)
             return
         }
@@ -317,8 +382,9 @@ class LyricsEngine {
         req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
         req.timeoutInterval = 3.5
 
-        URLSession.shared.dataTask(with: req) { data, _, _ in
-            guard let data = data,
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let self = self,
+                  let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let result = json["result"] as? [String: Any],
                   let songs = result["songs"] as? [[String: Any]], !songs.isEmpty else {
@@ -327,18 +393,34 @@ class LyricsEngine {
             }
 
             var bestId: Int?
-            var minDiff = 999.0
+            var maxScore = -999.0
+
             for song in songs {
-                if let sid = song["id"] as? Int, let durMs = song["duration"] as? Double {
-                    let diff = abs(durMs / 1000.0 - spotifySec)
-                    if diff < minDiff {
-                        minDiff = diff
-                        bestId = sid
-                    }
+                guard let sid = song["id"] as? Int,
+                      let durMs = song["duration"] as? Double,
+                      let stitle = song["name"] as? String else { continue }
+
+                var sartist = ""
+                if let artists = song["artists"] as? [[String: Any]], let first = artists.first, let aName = first["name"] as? String {
+                    sartist = aName
+                }
+
+                let score = self.computeConfidenceScore(
+                    candTitle: stitle,
+                    candArtist: sartist,
+                    targetTitle: simpTitle,
+                    targetArtist: simpArtist,
+                    candDuration: durMs / 1000.0,
+                    targetDuration: spotifySec
+                )
+
+                if score > maxScore {
+                    maxScore = score
+                    bestId = sid
                 }
             }
 
-            if let chosenId = bestId, minDiff <= 15.0 {
+            if let chosenId = bestId, maxScore >= 60.0 {
                 let lrcUrl = URL(string: "https://music.163.com/api/song/lyric?os=pc&id=\(chosenId)&lv=-1&kv=-1&tv=-1")!
                 URLSession.shared.dataTask(with: lrcUrl) { lrcData, _, _ in
                     if let lrcData = lrcData,
@@ -356,9 +438,10 @@ class LyricsEngine {
         }.resume()
     }
 
-    private func fetchFromQQMusic(query: String, spotifySec: Double, completion: @escaping (String?) -> Void) {
+    private func fetchFromQQMusic(rawTitle: String, rawArtist: String, simpTitle: String, simpArtist: String, spotifySec: Double, completion: @escaping (String?) -> Void) {
+        let query = "\(simpTitle) \(simpArtist)"
         guard let encodedQ = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let searchUrl = URL(string: "https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w=\(encodedQ)&format=json&n=5") else {
+              let searchUrl = URL(string: "https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w=\(encodedQ)&format=json&n=8") else {
             completion(nil)
             return
         }
@@ -368,8 +451,9 @@ class LyricsEngine {
         req.setValue("https://y.qq.com", forHTTPHeaderField: "Referer")
         req.timeoutInterval = 3.5
 
-        URLSession.shared.dataTask(with: req) { data, _, _ in
-            guard let data = data,
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let self = self,
+                  let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let dataObj = json["data"] as? [String: Any],
                   let songObj = dataObj["song"] as? [String: Any],
@@ -379,18 +463,34 @@ class LyricsEngine {
             }
 
             var bestMid: String?
-            var minDiff = 999.0
+            var maxScore = -999.0
+
             for song in songs {
-                if let mid = song["songmid"] as? String, let interval = song["interval"] as? Double {
-                    let diff = abs(interval - spotifySec)
-                    if diff < minDiff {
-                        minDiff = diff
-                        bestMid = mid
-                    }
+                guard let mid = song["songmid"] as? String,
+                      let interval = song["interval"] as? Double,
+                      let stitle = song["songname"] as? String else { continue }
+
+                var sartist = ""
+                if let singers = song["singer"] as? [[String: Any]], let first = singers.first, let aName = first["name"] as? String {
+                    sartist = aName
+                }
+
+                let score = self.computeConfidenceScore(
+                    candTitle: stitle,
+                    candArtist: sartist,
+                    targetTitle: simpTitle,
+                    targetArtist: simpArtist,
+                    candDuration: interval,
+                    targetDuration: spotifySec
+                )
+
+                if score > maxScore {
+                    maxScore = score
+                    bestMid = mid
                 }
             }
 
-            if let chosenMid = bestMid, minDiff <= 15.0 {
+            if let chosenMid = bestMid, maxScore >= 60.0 {
                 let lrcUrl = URL(string: "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid=\(chosenMid)&format=json&nobase64=1")!
                 var lrcReq = URLRequest(url: lrcUrl)
                 lrcReq.setValue("https://y.qq.com", forHTTPHeaderField: "Referer")
@@ -418,7 +518,7 @@ class LyricsEngine {
         }
 
         var req = URLRequest(url: url)
-        req.setValue("SpotifyFloatingLyrics/5.5", forHTTPHeaderField: "User-Agent")
+        req.setValue("SpotifyFloatingLyrics/5.6", forHTTPHeaderField: "User-Agent")
         req.timeoutInterval = 3.5
 
         URLSession.shared.dataTask(with: req) { data, _, _ in
@@ -436,7 +536,7 @@ class LyricsEngine {
                         }
                     }
                 }
-                if let raw = bestLrc, minDiff <= 15.0 {
+                if let raw = bestLrc, minDiff <= 12.0 {
                     completion(raw)
                     return
                 }
@@ -594,7 +694,7 @@ struct VisualEffectBackground: NSViewRepresentable {
     }
 }
 
-// MARK: - 8. 视图状态中心 (极致性能：零模糊着色器、硬件透明度缩放阶梯)
+// MARK: - 8. 视图状态中心 (防虚假暂停、最大字体限制、随高度多行自适应画卷)
 class LyricViewModel: ObservableObject {
     @Published var lyrics: [LyricLine] = []
     @Published var currentIndex: Int = -1
@@ -606,7 +706,8 @@ class LyricViewModel: ObservableObject {
     @Published var isHovered: Bool = false
     @Published var isPlayingState: Bool = false
     @Published var theme: LyricTheme = .appleMusic
-    @Published var isGlassDisabled: Bool = false  // 可选节能背景模式
+    @Published var isGlassDisabled: Bool = false
+    @Published var maxFontSizeLimit: CGFloat = 48.0 // 可配置的最大字体限制
 
     private var lastTrackKey: String = ""
     private var currentTitle: String = ""
@@ -618,17 +719,29 @@ class LyricViewModel: ObservableObject {
     private var smoothedOffsetCorrection: Double = 0.0
     private var lastPollTime: Double = 0
     private var isPollingInProgress: Bool = false
+    
+    // 防暂停抖动机制：连续检测到暂停才确认，防止切歌缓冲时误闪退暂停
+    private var consecutivePauseCount: Int = 0
 
     init() {
         let savedTheme = UserDefaults.standard.string(forKey: "LyricTheme") ?? LyricTheme.appleMusic.rawValue
         self.theme = LyricTheme(rawValue: savedTheme) ?? .appleMusic
         self.isGlassDisabled = UserDefaults.standard.bool(forKey: "isGlassDisabled")
+        let savedMaxFont = UserDefaults.standard.double(forKey: "MaxFontSizeLimit")
+        self.maxFontSizeLimit = savedMaxFont >= 24.0 ? CGFloat(savedMaxFont) : 48.0
+
         setupDistributedNotification()
     }
 
     func setTheme(_ t: LyricTheme) {
         self.theme = t
         UserDefaults.standard.set(t.rawValue, forKey: "LyricTheme")
+    }
+
+    func setMaxFontSize(_ size: CGFloat) {
+        self.maxFontSizeLimit = size
+        UserDefaults.standard.set(Double(size), forKey: "MaxFontSizeLimit")
+        recomputeFontAndLines()
     }
 
     func toggleGlassMode() {
@@ -642,13 +755,16 @@ class LyricViewModel: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
+            self?.consecutivePauseCount = 0
             self?.pollSpotify(forceSync: true)
         }
     }
 
     func onTick() {
         let now = CACurrentMediaTime()
-        if isPlayingState && (now - lastPollTime >= 4.5) {
+        // 关键防假死心跳：播放时 4.5 秒校准，暂停时也保持 2.5 秒低频轮询，保证恢复播放时秒级自动唤醒
+        let interval: Double = isPlayingState ? 4.5 : 2.5
+        if now - lastPollTime >= interval {
             lastPollTime = now
             pollSpotify(forceSync: false)
         } else if isPlayingState {
@@ -676,22 +792,35 @@ class LyricViewModel: ObservableObject {
         pollSpotify(forceSync: true, forceRefreshNetwork: true)
     }
 
+    private var currentWindowWidth: CGFloat = 560
+    private var currentWindowHeight: CGFloat = 100
+
     func updateDimensions(width: CGFloat, height: CGFloat) {
+        self.currentWindowWidth = width
+        self.currentWindowHeight = height
+        recomputeFontAndLines()
+    }
+
+    // 【核心升级】：高度增加后展示更多行数 + 最大字体限制可控
+    private func recomputeFontAndLines() {
+        let height = currentWindowHeight
+        let width = currentWindowWidth
+
         let targetLines: Int
-        if height < 80 {
-            targetLines = 1
-        } else if height < 150 {
-            targetLines = 3
-        } else if height < 240 {
-            targetLines = 5
+        if height < 75 {
+            targetLines = 1 // 迷你胶囊单行
         } else {
-            targetLines = 7
+            // 每行舒适行高 ~42pt，动态推导奇数行数 (3, 5, 7, 9, 11, 13, 15, 17, 19, 21)
+            let rawCount = max(3, Int(height / 42.0))
+            let oddCount = (rawCount % 2 == 1) ? rawCount : (rawCount - 1)
+            targetLines = min(oddCount, 21) // 最高展开至 21 行超沉浸画卷
         }
 
         let rowH = height / CGFloat(max(1, targetLines))
-        let widthFactor = max(0.90, min(width / 480.0, 1.50))
+        let widthFactor = max(0.90, min(width / 480.0, 1.35))
         let rawHeightSize = rowH * 0.65
-        let targetSize = max(16.0, min(rawHeightSize * widthFactor, 96.0))
+        // 关键：严格受控于用户设置的 maxFontSizeLimit，绝不过大突兀
+        let targetSize = max(15.0, min(rawHeightSize * widthFactor, maxFontSizeLimit))
 
         if self.displayLineCount != targetLines || abs(self.mainFontSize - targetSize) > 0.5 {
             self.displayLineCount = targetLines
@@ -710,18 +839,24 @@ class LyricViewModel: ObservableObject {
             DispatchQueue.main.async {
                 self.isPollingInProgress = false
                 guard let state = state else {
-                    self.isPlayingState = false
-                    self.isShowingLyrics = false
-                    if !self.currentTitle.isEmpty {
-                        self.placeholderTitle = "⏸ Spotify 已暂停"
-                        self.placeholderSubtitle = "\(self.currentTitle) - \(self.currentArtist)"
-                    } else {
-                        self.placeholderTitle = "等待 Spotify 播放..."
-                        self.placeholderSubtitle = ""
+                    // 防抖机制：连续 2 次检测到暂停才确认，过滤瞬态切歌缓冲
+                    self.consecutivePauseCount += 1
+                    if self.consecutivePauseCount >= 2 || forceSync {
+                        self.isPlayingState = false
+                        self.isShowingLyrics = false
+                        if !self.currentTitle.isEmpty {
+                            self.placeholderTitle = "⏸ Spotify 已暂停"
+                            self.placeholderSubtitle = "\(self.currentTitle) - \(self.currentArtist)"
+                        } else {
+                            self.placeholderTitle = "等待 Spotify 播放..."
+                            self.placeholderSubtitle = ""
+                        }
                     }
                     return
                 }
 
+                // 成功获取到播放状态，立即清零暂停计数器
+                self.consecutivePauseCount = 0
                 self.isPlayingState = true
                 let now = CACurrentMediaTime()
 
@@ -764,7 +899,7 @@ class LyricViewModel: ObservableObject {
                                 self.updateLyricsPosition(pos: self.basePosition)
                             } else {
                                 self.placeholderTitle = "🎵 \(state.title)"
-                                self.placeholderSubtitle = "\(state.artist) (三源检索完毕，暂无滚动歌词)"
+                                self.placeholderSubtitle = "\(state.artist) (三源检索完毕，暂无匹配歌词)"
                             }
                         }
                     }
@@ -788,7 +923,6 @@ class LyricViewModel: ObservableObject {
         }
 
         if newIndex != self.currentIndex {
-            // 关键优化：快速收敛阻尼弹性 (0.36s)，GPU 绘制窗口缩短 40%
             withAnimation(.spring(response: 0.36, dampingFraction: 0.86, blendDuration: 0.15)) {
                 self.currentIndex = newIndex
             }
@@ -811,7 +945,6 @@ struct LyricFloatingView: View {
                     RoundedRectangle(cornerRadius: 20, style: .continuous)
                         .fill(Color.black.opacity(0.20))
                 } else {
-                    // 超省电模式：纯半透明深黑底色，完全避免系统抓取壁纸
                     RoundedRectangle(cornerRadius: 20, style: .continuous)
                         .fill(Color(white: 0.08).opacity(0.85))
                 }
@@ -832,7 +965,6 @@ struct LyricFloatingView: View {
                     if vm.displayLineCount == 1 {
                         singleLineCapsuleView
                     } else {
-                        // 零 GPU 离屏模糊的流体推移视图
                         multiLineZeroGpuOverheadView(geo: geo)
                     }
                 } else {
@@ -866,7 +998,6 @@ struct LyricFloatingView: View {
                     .font(.system(size: vm.mainFontSize, weight: .bold, design: .rounded))
                     .tracking(0.4)
                     .foregroundColor(vm.theme.focusColor)
-                    // 单层轻量抗白底微阴影，0 GPU 发光扩散着色器
                     .shadow(color: Color.black.opacity(0.70), radius: 1.5, x: 0, y: 1.0)
                     .lineLimit(1)
                     .minimumScaleFactor(0.35)
@@ -884,16 +1015,15 @@ struct LyricFloatingView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    // MARK: 关键突破：零 GPU 离屏模糊的多行推移视图
-    // 彻底移除 Text 的实时动态高斯模糊 (.blur) 与动态发光投影 (.shadow)，改用纯 GPU 硬件零成本的 opacity 与 scale
+    // MARK: 多行连续位移推移 (随窗口高度动态适配更多行数)
     private func multiLineZeroGpuOverheadView(geo: GeometryProxy) -> some View {
         let rowHeight = geo.size.height / CGFloat(max(1, vm.displayLineCount))
         let targetIdx = max(0, vm.currentIndex)
         let centerOffset = (geo.size.height - rowHeight) / 2.0
         let currentY = -CGFloat(targetIdx) * rowHeight + centerOffset
 
-        // 仅切片当前视口可见的 7~9 行
-        let half = max(vm.displayLineCount / 2, 2) + 1
+        // 视口切片动态跟随展示行数扩展，完美覆盖大高度多行画卷
+        let half = max(vm.displayLineCount / 2, 2) + 2
         let minIdx = max(0, targetIdx - half)
         let maxIdx = min(vm.lyrics.count - 1, targetIdx + half)
         let visibleSlice = (minIdx <= maxIdx) ? Array(vm.lyrics[minIdx...maxIdx]) : []
@@ -903,10 +1033,9 @@ struct LyricFloatingView: View {
                 let dist = abs(line.id - vm.currentIndex)
                 let isCur = (line.id == vm.currentIndex)
 
-                // 纯 GPU 硬件级透明度阶梯：当前行 1.0，第 1 邻行 0.45，第 2 邻行 0.18，其余 0.08
-                let opacity: Double = isCur ? 1.0 : (dist == 1 ? 0.45 : (dist == 2 ? 0.18 : 0.08))
-                // 纯 GPU 硬件级平滑缩放
-                let scale: CGFloat = isCur ? 1.04 : (dist == 1 ? 0.90 : 0.80)
+                // 优雅的自然光度衰减阶梯
+                let opacity: Double = isCur ? 1.0 : (dist == 1 ? 0.48 : (dist == 2 ? 0.24 : (dist == 3 ? 0.14 : 0.08)))
+                let scale: CGFloat = isCur ? 1.03 : (dist == 1 ? 0.92 : (dist == 2 ? 0.84 : 0.78))
                 let lineY = CGFloat(line.id) * rowHeight + currentY
 
                 HStack {
@@ -922,8 +1051,7 @@ struct LyricFloatingView: View {
                         ))
                         .tracking(0.3)
                         .foregroundColor(isCur ? vm.theme.focusColor : vm.theme.dimColor.opacity(opacity))
-                        // 彻底剔除动态 .blur 与多层发光 .shadow，仅保留极轻量单层固定暗轮廓防发飘
-                        .shadow(color: Color.black.opacity(isCur ? 0.65 : 0.30), radius: 1.5, x: 0, y: 1.0)
+                        .shadow(color: Color.black.opacity(isCur ? 0.65 : 0.25), radius: 1.5, x: 0, y: 1.0)
                         .lineLimit(1)
                         .minimumScaleFactor(0.35)
                         .padding(.horizontal, 22)
@@ -1028,7 +1156,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func setupWindow() {
-        var initialRect = NSRect(x: 0, y: 0, width: 560, height: 100)
+        var initialRect = NSRect(x: 0, y: 0, width: 560, height: 110)
         if let saved = UserDefaults.standard.string(forKey: "WindowFrame") {
             let r = NSRectFromString(saved)
             if r.width >= 260 && r.height >= 50 {
@@ -1053,7 +1181,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.hasShadow = true
 
         window.minSize = NSSize(width: 260, height: 50)
-        window.maxSize = NSSize(width: 1800, height: 650)
+        window.maxSize = NSSize(width: 1800, height: 1200)
 
         if UserDefaults.standard.string(forKey: "WindowFrame") == nil, let screen = NSScreen.main {
             let screenFrame = screen.visibleFrame
@@ -1117,7 +1245,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func updateMenu() {
         let menu = NSMenu()
         let count = RobustLyricsCache.shared.getCachedCount()
-        let titleItem = NSMenuItem(title: "🎵 Spotify 歌词助手 V5.5 (零 GPU 抖动版)", action: nil, keyEquivalent: "")
+        let titleItem = NSMenuItem(title: "🎵 Spotify 歌词助手 V5.6", action: nil, keyEquivalent: "")
         titleItem.isEnabled = false
         menu.addItem(titleItem)
         menu.addItem(NSMenuItem.separator())
@@ -1142,6 +1270,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         themeParent.submenu = themeMenu
         menu.addItem(themeParent)
 
+        // 🔤 最大字体上限子菜单
+        let fontMenu = NSMenu()
+        let fontOptions: [(String, CGFloat)] = [
+            ("32 pt (精巧小字)", 32.0),
+            ("40 pt (适中小字)", 40.0),
+            ("48 pt (标准推荐)", 48.0),
+            ("60 pt (大字醒目)", 60.0),
+            ("76 pt (超大画卷)", 76.0),
+            ("96 pt (极限巨幕)", 96.0)
+        ]
+        for (label, sz) in fontOptions {
+            let isSelected = abs(vm.maxFontSizeLimit - sz) < 1.0
+            let item = NSMenuItem(title: (isSelected ? "✓ " : "   ") + label, action: #selector(changeMaxFontAction(_:)), keyEquivalent: "")
+            item.representedObject = sz
+            fontMenu.addItem(item)
+        }
+        let fontParent = NSMenuItem(title: "🔤 最大字体上限 (\(Int(vm.maxFontSizeLimit)) pt)", action: nil, keyEquivalent: "")
+        fontParent.submenu = fontMenu
+        menu.addItem(fontParent)
+
         // ⚡️ 节能背景模式切换
         let glassTitle = vm.isGlassDisabled ? "✓ 极致节能模式 (已停用桌面毛玻璃)" : "切换至极致节能背景 (停用桌面毛玻璃)"
         let glassItem = NSMenuItem(title: glassTitle, action: #selector(toggleGlassAction), keyEquivalent: "")
@@ -1155,6 +1303,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(NSMenuItem(title: "退出 SpotifyLyrics", action: #selector(quitApp), keyEquivalent: "q"))
 
         statusItem.menu = menu
+    }
+
+    @objc func changeMaxFontAction(_ sender: NSMenuItem) {
+        if let sz = sender.representedObject as? CGFloat {
+            vm.setMaxFontSize(sz)
+            updateMenu()
+        }
     }
 
     @objc func toggleGlassAction() {
@@ -1205,7 +1360,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let screen = NSScreen.main {
             let screenFrame = screen.visibleFrame
             let w: CGFloat = 560
-            let h: CGFloat = 100
+            let h: CGFloat = 110
             let x = screenFrame.origin.x + (screenFrame.width - w) / 2
             let y = screenFrame.origin.y + 60
             window.setFrame(NSRect(x: x, y: y, width: w, height: h), display: true, animate: true)
