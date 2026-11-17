@@ -119,7 +119,7 @@ func parseDuetAlignment(text: String, artist: String) -> (DuetAlignment, String)
     return (.center, t)
 }
 
-// MARK: - 3. 字体色彩主题管理器
+// MARK: - 3. 字体色彩与字号档位管理器
 enum LyricTheme: String, CaseIterable, Identifiable {
     case appleMusic = "classic"
     case aurora     = "aurora"
@@ -148,6 +148,28 @@ enum LyricTheme: String, CaseIterable, Identifiable {
         case .appleMusic: return Color.white
         case .aurora:     return Color(red: 0.75, green: 0.88, blue: 0.95)
         case .amber:      return Color(red: 0.95, green: 0.88, blue: 0.75)
+        }
+    }
+}
+
+enum LyricFontSizeOption: Double, CaseIterable, Identifiable {
+    case small    = 18.0
+    case medium   = 24.0
+    case standard = 30.0
+    case large    = 40.0
+    case xlarge   = 52.0
+    case huge     = 68.0
+
+    var id: Double { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .small:    return "18 pt (精巧小字 · 容纳更多行)"
+        case .medium:   return "24 pt (适中小字 · 经典视野)"
+        case .standard: return "30 pt (标准推荐 · 均衡呼吸)"
+        case .large:    return "40 pt (大字醒目 · 舒适观赏)"
+        case .xlarge:   return "52 pt (超大画卷 · 气势磅礴)"
+        case .huge:     return "68 pt (极限海报 · 巨幕大字)"
         }
     }
 }
@@ -327,7 +349,6 @@ class LyricsEngine {
         }
     }
 
-    // 辅助计算曲目匹配置信度评分
     private func computeConfidenceScore(candTitle: String, candArtist: String, targetTitle: String, targetArtist: String, candDuration: Double, targetDuration: Double) -> Double {
         var score: Double = 100.0
 
@@ -336,19 +357,19 @@ class LyricsEngine {
         let tt = toSimplified(targetTitle).lowercased()
         let ta = toSimplified(targetArtist).lowercased()
 
-        // 1. 严格排斥干扰标签（伴奏/纯音乐/翻唱）
+        // 1. 严格排斥干扰标签
         let negativeKeywords = ["伴奏", "纯音乐", "instrumental", "karaoke", "piano", "cover", "翻唱", "铃声"]
         for kw in negativeKeywords {
             if ct.contains(kw) && !tt.contains(kw) {
-                return -999.0 // 直接废弃
+                return -999.0
             }
         }
 
-        // 2. 歌手匹配权重 (最高权重)
+        // 2. 歌手匹配权重
         if ca.contains(ta) || ta.contains(ca) {
             score += 40.0
         } else {
-            score -= 50.0 // 歌手对不上，大幅扣分
+            score -= 50.0
         }
 
         // 3. 歌名匹配
@@ -363,7 +384,7 @@ class LyricsEngine {
         // 4. 时长差异衰减
         let diff = abs(candDuration - targetDuration)
         if diff > 15.0 {
-            return -999.0 // 误差超过15秒直接放弃
+            return -999.0
         }
         score -= diff * 3.5
 
@@ -518,7 +539,7 @@ class LyricsEngine {
         }
 
         var req = URLRequest(url: url)
-        req.setValue("SpotifyFloatingLyrics/5.6", forHTTPHeaderField: "User-Agent")
+        req.setValue("SpotifyFloatingLyrics/5.7", forHTTPHeaderField: "User-Agent")
         req.timeoutInterval = 3.5
 
         URLSession.shared.dataTask(with: req) { data, _, _ in
@@ -694,20 +715,20 @@ struct VisualEffectBackground: NSViewRepresentable {
     }
 }
 
-// MARK: - 8. 视图状态中心 (防虚假暂停、最大字体限制、随高度多行自适应画卷)
+// MARK: - 8. 视图状态中心 (以用户选择字号为核心，联动高度自适应展开行数)
 class LyricViewModel: ObservableObject {
     @Published var lyrics: [LyricLine] = []
     @Published var currentIndex: Int = -1
     @Published var placeholderTitle: String = "🎵 正在连接 Spotify..."
     @Published var placeholderSubtitle: String = "请在 Spotify 播放歌曲"
     @Published var isShowingLyrics: Bool = false
-    @Published var mainFontSize: CGFloat = 26.0
+    @Published var mainFontSize: CGFloat = 30.0
     @Published var displayLineCount: Int = 3
     @Published var isHovered: Bool = false
     @Published var isPlayingState: Bool = false
     @Published var theme: LyricTheme = .appleMusic
     @Published var isGlassDisabled: Bool = false
-    @Published var maxFontSizeLimit: CGFloat = 48.0 // 可配置的最大字体限制
+    @Published var userSelectedFontSize: CGFloat = 30.0
 
     private var lastTrackKey: String = ""
     private var currentTitle: String = ""
@@ -719,16 +740,18 @@ class LyricViewModel: ObservableObject {
     private var smoothedOffsetCorrection: Double = 0.0
     private var lastPollTime: Double = 0
     private var isPollingInProgress: Bool = false
-    
-    // 防暂停抖动机制：连续检测到暂停才确认，防止切歌缓冲时误闪退暂停
     private var consecutivePauseCount: Int = 0
+
+    private var currentWindowWidth: CGFloat = 560
+    private var currentWindowHeight: CGFloat = 110
 
     init() {
         let savedTheme = UserDefaults.standard.string(forKey: "LyricTheme") ?? LyricTheme.appleMusic.rawValue
         self.theme = LyricTheme(rawValue: savedTheme) ?? .appleMusic
         self.isGlassDisabled = UserDefaults.standard.bool(forKey: "isGlassDisabled")
-        let savedMaxFont = UserDefaults.standard.double(forKey: "MaxFontSizeLimit")
-        self.maxFontSizeLimit = savedMaxFont >= 24.0 ? CGFloat(savedMaxFont) : 48.0
+        let savedFont = UserDefaults.standard.double(forKey: "UserSelectedFontSize")
+        self.userSelectedFontSize = savedFont >= 16.0 ? CGFloat(savedFont) : 30.0
+        self.mainFontSize = self.userSelectedFontSize
 
         setupDistributedNotification()
     }
@@ -738,9 +761,9 @@ class LyricViewModel: ObservableObject {
         UserDefaults.standard.set(t.rawValue, forKey: "LyricTheme")
     }
 
-    func setMaxFontSize(_ size: CGFloat) {
-        self.maxFontSizeLimit = size
-        UserDefaults.standard.set(Double(size), forKey: "MaxFontSizeLimit")
+    func setUserFontSize(_ size: CGFloat) {
+        self.userSelectedFontSize = size
+        UserDefaults.standard.set(Double(size), forKey: "UserSelectedFontSize")
         recomputeFontAndLines()
     }
 
@@ -762,7 +785,6 @@ class LyricViewModel: ObservableObject {
 
     func onTick() {
         let now = CACurrentMediaTime()
-        // 关键防假死心跳：播放时 4.5 秒校准，暂停时也保持 2.5 秒低频轮询，保证恢复播放时秒级自动唤醒
         let interval: Double = isPlayingState ? 4.5 : 2.5
         if now - lastPollTime >= interval {
             lastPollTime = now
@@ -792,39 +814,39 @@ class LyricViewModel: ObservableObject {
         pollSpotify(forceSync: true, forceRefreshNetwork: true)
     }
 
-    private var currentWindowWidth: CGFloat = 560
-    private var currentWindowHeight: CGFloat = 100
-
     func updateDimensions(width: CGFloat, height: CGFloat) {
         self.currentWindowWidth = width
         self.currentWindowHeight = height
         recomputeFontAndLines()
     }
 
-    // 【核心升级】：高度增加后展示更多行数 + 最大字体限制可控
+    // 【核心算法重构】：字号真正随用户设置生效 + 高度拉大后自适应铺满更多行数
     private func recomputeFontAndLines() {
         let height = currentWindowHeight
-        let width = currentWindowWidth
+        let baseSize = userSelectedFontSize
 
-        let targetLines: Int
         if height < 75 {
-            targetLines = 1 // 迷你胶囊单行
-        } else {
-            // 每行舒适行高 ~42pt，动态推导奇数行数 (3, 5, 7, 9, 11, 13, 15, 17, 19, 21)
-            let rawCount = max(3, Int(height / 42.0))
-            let oddCount = (rawCount % 2 == 1) ? rawCount : (rawCount - 1)
-            targetLines = min(oddCount, 21) // 最高展开至 21 行超沉浸画卷
+            // 单行迷你胶囊模式
+            self.displayLineCount = 1
+            self.mainFontSize = min(baseSize * 1.15, height * 0.65)
+            return
         }
 
-        let rowH = height / CGFloat(max(1, targetLines))
-        let widthFactor = max(0.90, min(width / 480.0, 1.35))
-        let rawHeightSize = rowH * 0.65
-        // 关键：严格受控于用户设置的 maxFontSizeLimit，绝不过大突兀
-        let targetSize = max(15.0, min(rawHeightSize * widthFactor, maxFontSizeLimit))
+        // 以该字号对应的黄金行高槽位 (slotHeight) 自适应推导当前高度能舒适容纳几行
+        let slotHeight = baseSize * 1.48
+        let rawCount = Int(height / slotHeight)
+        // 保证奇数行居中呈现 (3, 5, 7, 9, 11, 13, 15, 17, 19, 21)
+        let oddCount = (rawCount % 2 == 1) ? rawCount : (rawCount - 1)
+        let targetLines = max(3, min(oddCount, 21))
 
-        if self.displayLineCount != targetLines || abs(self.mainFontSize - targetSize) > 0.5 {
+        // 真实行高
+        let actualRowHeight = height / CGFloat(targetLines)
+        // 字号严格以用户选择的 baseSize 为主导，并在极小高度时安全微调
+        let finalSize = min(baseSize, actualRowHeight * 0.72)
+
+        if self.displayLineCount != targetLines || abs(self.mainFontSize - finalSize) > 0.3 {
             self.displayLineCount = targetLines
-            self.mainFontSize = targetSize
+            self.mainFontSize = max(14.0, finalSize)
         }
     }
 
@@ -839,7 +861,6 @@ class LyricViewModel: ObservableObject {
             DispatchQueue.main.async {
                 self.isPollingInProgress = false
                 guard let state = state else {
-                    // 防抖机制：连续 2 次检测到暂停才确认，过滤瞬态切歌缓冲
                     self.consecutivePauseCount += 1
                     if self.consecutivePauseCount >= 2 || forceSync {
                         self.isPlayingState = false
@@ -855,7 +876,6 @@ class LyricViewModel: ObservableObject {
                     return
                 }
 
-                // 成功获取到播放状态，立即清零暂停计数器
                 self.consecutivePauseCount = 0
                 self.isPlayingState = true
                 let now = CACurrentMediaTime()
@@ -937,7 +957,7 @@ struct LyricFloatingView: View {
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                // 1. 背景层：支持系统毛玻璃或超省电暗透模式
+                // 1. 背景层
                 if !vm.isGlassDisabled {
                     VisualEffectBackground(material: .hudWindow, blendingMode: .behindWindow, state: .active)
                         .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
@@ -985,7 +1005,7 @@ struct LyricFloatingView: View {
         }
     }
 
-    // MARK: 单行迷你胶囊视图 (上下推移转场)
+    // MARK: 单行迷你胶囊视图
     private var singleLineCapsuleView: some View {
         let curLine = (vm.currentIndex >= 0 && vm.currentIndex < vm.lyrics.count)
             ? vm.lyrics[vm.currentIndex]
@@ -1022,7 +1042,6 @@ struct LyricFloatingView: View {
         let centerOffset = (geo.size.height - rowHeight) / 2.0
         let currentY = -CGFloat(targetIdx) * rowHeight + centerOffset
 
-        // 视口切片动态跟随展示行数扩展，完美覆盖大高度多行画卷
         let half = max(vm.displayLineCount / 2, 2) + 2
         let minIdx = max(0, targetIdx - half)
         let maxIdx = min(vm.lyrics.count - 1, targetIdx + half)
@@ -1033,7 +1052,6 @@ struct LyricFloatingView: View {
                 let dist = abs(line.id - vm.currentIndex)
                 let isCur = (line.id == vm.currentIndex)
 
-                // 优雅的自然光度衰减阶梯
                 let opacity: Double = isCur ? 1.0 : (dist == 1 ? 0.48 : (dist == 2 ? 0.24 : (dist == 3 ? 0.14 : 0.08)))
                 let scale: CGFloat = isCur ? 1.03 : (dist == 1 ? 0.92 : (dist == 2 ? 0.84 : 0.78))
                 let lineY = CGFloat(line.id) * rowHeight + currentY
@@ -1245,7 +1263,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func updateMenu() {
         let menu = NSMenu()
         let count = RobustLyricsCache.shared.getCachedCount()
-        let titleItem = NSMenuItem(title: "🎵 Spotify 歌词助手 V5.6", action: nil, keyEquivalent: "")
+        let titleItem = NSMenuItem(title: "🎵 Spotify 歌词助手 V5.7", action: nil, keyEquivalent: "")
         titleItem.isEnabled = false
         menu.addItem(titleItem)
         menu.addItem(NSMenuItem.separator())
@@ -1270,23 +1288,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         themeParent.submenu = themeMenu
         menu.addItem(themeParent)
 
-        // 🔤 最大字体上限子菜单
+        // 🔤 字体大小实时档位切换菜单
         let fontMenu = NSMenu()
-        let fontOptions: [(String, CGFloat)] = [
-            ("32 pt (精巧小字)", 32.0),
-            ("40 pt (适中小字)", 40.0),
-            ("48 pt (标准推荐)", 48.0),
-            ("60 pt (大字醒目)", 60.0),
-            ("76 pt (超大画卷)", 76.0),
-            ("96 pt (极限巨幕)", 96.0)
-        ]
-        for (label, sz) in fontOptions {
-            let isSelected = abs(vm.maxFontSizeLimit - sz) < 1.0
-            let item = NSMenuItem(title: (isSelected ? "✓ " : "   ") + label, action: #selector(changeMaxFontAction(_:)), keyEquivalent: "")
-            item.representedObject = sz
+        for opt in LyricFontSizeOption.allCases {
+            let isSelected = abs(vm.userSelectedFontSize - opt.rawValue) < 1.0
+            let item = NSMenuItem(title: (isSelected ? "✓ " : "   ") + opt.displayName, action: #selector(changeFontSizeAction(_:)), keyEquivalent: "")
+            item.representedObject = NSNumber(value: opt.rawValue)
             fontMenu.addItem(item)
         }
-        let fontParent = NSMenuItem(title: "🔤 最大字体上限 (\(Int(vm.maxFontSizeLimit)) pt)", action: nil, keyEquivalent: "")
+        let fontParent = NSMenuItem(title: "🔤 字体大小与行数联动 (当前: \(Int(vm.userSelectedFontSize)) pt)", action: nil, keyEquivalent: "")
         fontParent.submenu = fontMenu
         menu.addItem(fontParent)
 
@@ -1305,9 +1315,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusItem.menu = menu
     }
 
-    @objc func changeMaxFontAction(_ sender: NSMenuItem) {
-        if let sz = sender.representedObject as? CGFloat {
-            vm.setMaxFontSize(sz)
+    @objc func changeFontSizeAction(_ sender: NSMenuItem) {
+        if let num = sender.representedObject as? NSNumber {
+            let sz = CGFloat(num.doubleValue)
+            vm.setUserFontSize(sz)
             updateMenu()
         }
     }
