@@ -1065,10 +1065,10 @@ struct LyricFloatingView: View {
                     }
 
                     Text(line.text.isEmpty ? "···" : line.text)
-                        // 关键：字号绝对固定！绝不动态传参，杜绝 CoreText 逐帧重新矢量栅格化！
+                        // 关键：字号与字重（.semibold）全局恒定统一！绝对不在当前行/非当前行切换字重，彻底消除从粗体切换到细体时字符宽度突变引发的抽搐跳动！
                         .font(.system(
                             size: vm.mainFontSize,
-                            weight: isCur ? .bold : .medium,
+                            weight: .semibold,
                             design: .rounded
                         ))
                         .tracking(0.3)
