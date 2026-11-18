@@ -943,7 +943,8 @@ class LyricViewModel: ObservableObject {
         }
 
         if newIndex != self.currentIndex {
-            withAnimation(.spring(response: 0.36, dampingFraction: 0.86, blendDuration: 0.15)) {
+            // 关键：采用临界阻尼弹簧 (dampingFraction: 1.0)，物理上彻底消除到达目标后的回弹微振荡（Zero Ringing/Zero Jitter）
+            withAnimation(.spring(response: 0.38, dampingFraction: 1.0, blendDuration: 0.10)) {
                 self.currentIndex = newIndex
             }
         }
@@ -1005,7 +1006,7 @@ struct LyricFloatingView: View {
         }
     }
 
-    // MARK: 单行迷你胶囊视图
+    // MARK: 单行迷你胶囊视图 (平滑呼吸位移)
     private var singleLineCapsuleView: some View {
         let curLine = (vm.currentIndex >= 0 && vm.currentIndex < vm.lyrics.count)
             ? vm.lyrics[vm.currentIndex]
@@ -1023,8 +1024,8 @@ struct LyricFloatingView: View {
                     .minimumScaleFactor(0.35)
                     .padding(.horizontal, 22)
                     .transition(.asymmetric(
-                        insertion: .move(edge: .bottom).combined(with: .opacity),
-                        removal: .move(edge: .top).combined(with: .opacity)
+                        insertion: .opacity.combined(with: .offset(y: 8)),
+                        removal: .opacity.combined(with: .offset(y: -8))
                     ))
             } else {
                 Text("🎵 前奏中...")
@@ -1035,14 +1036,15 @@ struct LyricFloatingView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    // MARK: 多行连续位移推移 (随窗口高度动态适配更多行数)
+    // MARK: 多行连续位移推移 (零抖动、零重排、临界阻尼硬件平移)
     private func multiLineZeroGpuOverheadView(geo: GeometryProxy) -> some View {
         let rowHeight = geo.size.height / CGFloat(max(1, vm.displayLineCount))
         let targetIdx = max(0, vm.currentIndex)
         let centerOffset = (geo.size.height - rowHeight) / 2.0
         let currentY = -CGFloat(targetIdx) * rowHeight + centerOffset
 
-        let half = max(vm.displayLineCount / 2, 2) + 2
+        // 宽裕对称视口：预留足够前后缓冲区，防止视口切片突入抖动
+        let half = max(vm.displayLineCount / 2, 2) + 3
         let minIdx = max(0, targetIdx - half)
         let maxIdx = min(vm.lyrics.count - 1, targetIdx + half)
         let visibleSlice = (minIdx <= maxIdx) ? Array(vm.lyrics[minIdx...maxIdx]) : []
@@ -1052,8 +1054,9 @@ struct LyricFloatingView: View {
                 let dist = abs(line.id - vm.currentIndex)
                 let isCur = (line.id == vm.currentIndex)
 
-                let opacity: Double = isCur ? 1.0 : (dist == 1 ? 0.48 : (dist == 2 ? 0.24 : (dist == 3 ? 0.14 : 0.08)))
-                let scale: CGFloat = isCur ? 1.03 : (dist == 1 ? 0.92 : (dist == 2 ? 0.84 : 0.78))
+                // 纯硬件级透明度与缩放阶梯
+                let opacity: Double = isCur ? 1.0 : (dist == 1 ? 0.48 : (dist == 2 ? 0.22 : (dist == 3 ? 0.12 : 0.05)))
+                let scale: CGFloat = isCur ? 1.04 : (dist == 1 ? 0.92 : (dist == 2 ? 0.84 : 0.78))
                 let lineY = CGFloat(line.id) * rowHeight + currentY
 
                 HStack {
@@ -1062,14 +1065,20 @@ struct LyricFloatingView: View {
                     }
 
                     Text(line.text.isEmpty ? "···" : line.text)
+                        // 关键：字号绝对固定！绝不动态传参，杜绝 CoreText 逐帧重新矢量栅格化！
                         .font(.system(
-                            size: vm.mainFontSize * scale,
+                            size: vm.mainFontSize,
                             weight: isCur ? .bold : .medium,
                             design: .rounded
                         ))
                         .tracking(0.3)
                         .foregroundColor(isCur ? vm.theme.focusColor : vm.theme.dimColor.opacity(opacity))
                         .shadow(color: Color.black.opacity(isCur ? 0.65 : 0.25), radius: 1.5, x: 0, y: 1.0)
+                        // 关键：纯 GPU 硬件纹理缩放，零 CPU 参与，彻底消除文字字距物理抖动！
+                        .scaleEffect(
+                            scale,
+                            anchor: line.alignment == .leading ? .leading : (line.alignment == .trailing ? .trailing : .center)
+                        )
                         .lineLimit(1)
                         .minimumScaleFactor(0.35)
                         .padding(.horizontal, 22)
@@ -1083,10 +1092,11 @@ struct LyricFloatingView: View {
                     }
                 }
                 .frame(width: geo.size.width, height: rowHeight)
-                .position(x: geo.size.width / 2.0, y: lineY + rowHeight / 2.0)
+                // 关键：纯 GPU 硬件矩阵位移，完全取代触发频繁重排的 .position()
+                .offset(x: 0, y: lineY)
             }
         }
-        .frame(width: geo.size.width, height: geo.size.height)
+        .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
         .clipped()
     }
 
