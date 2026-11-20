@@ -729,6 +729,10 @@ class LyricViewModel: ObservableObject {
     @Published var theme: LyricTheme = .appleMusic
     @Published var isGlassDisabled: Bool = false
     @Published var userSelectedFontSize: CGFloat = 30.0
+    @Published var isAlwaysOnTop: Bool = false
+
+    var onToggleAlwaysOnTop: (() -> Void)?
+    var onMinimizeWindow: (() -> Void)?
 
     private var lastTrackKey: String = ""
     private var currentTitle: String = ""
@@ -752,6 +756,7 @@ class LyricViewModel: ObservableObject {
         let savedFont = UserDefaults.standard.double(forKey: "UserSelectedFontSize")
         self.userSelectedFontSize = savedFont >= 16.0 ? CGFloat(savedFont) : 30.0
         self.mainFontSize = self.userSelectedFontSize
+        self.isAlwaysOnTop = UserDefaults.standard.bool(forKey: "isAlwaysOnTop")
 
         setupDistributedNotification()
     }
@@ -1125,11 +1130,34 @@ struct LyricFloatingView: View {
         .padding(.vertical, 8)
     }
 
-    // MARK: 悬停迷你切歌条
+    // MARK: 悬停迷你控制条 (支持置顶切换、最小化到 Dock、切歌控制)
     private var hoverControlsBar: some View {
         HStack(spacing: 12) {
             Spacer()
-            HStack(spacing: 8) {
+            HStack(spacing: 7) {
+                // 窗口置顶切换 (图钉)
+                Button(action: { vm.onToggleAlwaysOnTop?() }) {
+                    Image(systemName: vm.isAlwaysOnTop ? "pin.fill" : "pin.slash")
+                        .font(.system(size: 11))
+                        .foregroundColor(vm.isAlwaysOnTop ? Color.yellow.opacity(0.95) : Color.white.opacity(0.75))
+                }
+                .buttonStyle(.plain)
+                .help(vm.isAlwaysOnTop ? "当前：永远置顶 (点击取消置顶)" : "当前：普通层级 (点击开启置顶)")
+
+                // 最小化到 Dock (减号)
+                Button(action: { vm.onMinimizeWindow?() }) {
+                    Image(systemName: "minus")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(.white.opacity(0.85))
+                }
+                .buttonStyle(.plain)
+                .help("最小化歌词窗口到 Dock (⌘M)")
+
+                // 分隔点
+                Circle()
+                    .fill(Color.white.opacity(0.30))
+                    .frame(width: 3, height: 3)
+
                 Button(action: { SpotifyController.shared.previous() }) {
                     Image(systemName: "backward.fill")
                         .font(.system(size: 11))
@@ -1153,7 +1181,7 @@ struct LyricFloatingView: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
-            .background(Capsule().fill(Color.black.opacity(0.55)))
+            .background(Capsule().fill(Color.black.opacity(0.60)))
             .padding(.trailing, 12)
         }
         .frame(maxHeight: .infinity, alignment: .topTrailing)
@@ -1171,6 +1199,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private var isMiniMode: Bool = false
     private var lastExpandedHeight: CGFloat = 160.0
+
+    private var isAlwaysOnTop: Bool {
+        get { UserDefaults.standard.bool(forKey: "isAlwaysOnTop") }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "isAlwaysOnTop")
+            window.level = newValue ? .floating : .normal
+            vm.isAlwaysOnTop = newValue
+            updateMenu()
+        }
+    }
 
     private var isClickThrough: Bool {
         get { UserDefaults.standard.bool(forKey: "isClickThrough") }
@@ -1194,7 +1232,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         window = NSWindow(
             contentRect: initialRect,
-            styleMask: [.titled, .resizable, .fullSizeContentView],
+            styleMask: [.titled, .resizable, .miniaturizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
@@ -1203,7 +1241,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
-        window.level = .floating
+        window.level = isAlwaysOnTop ? .floating : .normal
         window.backgroundColor = .clear
         window.isOpaque = false
         window.hasShadow = true
@@ -1219,6 +1257,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         window.ignoresMouseEvents = isClickThrough
+
+        vm.onToggleAlwaysOnTop = { [weak self] in
+            self?.toggleAlwaysOnTop()
+        }
+        vm.onMinimizeWindow = { [weak self] in
+            self?.minimizeWindow()
+        }
 
         let doubleClickGesture = NSClickGestureRecognizer(target: self, action: #selector(handleDoubleClick))
         doubleClickGesture.numberOfClicksRequired = 2
@@ -1258,6 +1303,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         vm.updateDimensions(width: window.frame.width, height: window.frame.height)
     }
 
+    func windowDidMiniaturize(_ notification: Notification) {
+        updateMenu()
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        updateMenu()
+    }
+
     private func saveWindowState() {
         UserDefaults.standard.set(NSStringFromRect(window.frame), forKey: "WindowFrame")
     }
@@ -1273,18 +1326,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func updateMenu() {
         let menu = NSMenu()
         let count = RobustLyricsCache.shared.getCachedCount()
-        let titleItem = NSMenuItem(title: "🎵 Spotify 歌词助手 V5.7", action: nil, keyEquivalent: "")
+        let titleItem = NSMenuItem(title: "🎵 Spotify 歌词助手 V5.8", action: nil, keyEquivalent: "")
         titleItem.isEnabled = false
         menu.addItem(titleItem)
         menu.addItem(NSMenuItem.separator())
 
         menu.addItem(NSMenuItem(title: "显示 / 隐藏 桌面歌词", action: #selector(toggleWindow), keyEquivalent: "h"))
 
+        let topTitle = isAlwaysOnTop ? "✓ 窗口永远置顶 (已开启)" : "开启窗口永远置顶模式"
+        menu.addItem(NSMenuItem(title: topTitle, action: #selector(toggleAlwaysOnTop), keyEquivalent: "t"))
+
+        let miniTitle = window.isMiniaturized ? "从 Dock 恢复歌词窗口" : "最小化歌词窗口到 Dock"
+        menu.addItem(NSMenuItem(title: miniTitle, action: #selector(minimizeWindow), keyEquivalent: "m"))
+
         let clickThroughTitle = isClickThrough ? "✓ 鼠标点击穿透模式 (已开启)" : "开启鼠标点击穿透模式"
         let clickThroughItem = NSMenuItem(title: clickThroughTitle, action: #selector(toggleClickThrough), keyEquivalent: "p")
         menu.addItem(clickThroughItem)
 
-        menu.addItem(NSMenuItem(title: "双击折叠/展开单行模式", action: #selector(handleDoubleClick), keyEquivalent: "m"))
+        menu.addItem(NSMenuItem(title: "双击折叠/展开单行模式", action: #selector(handleDoubleClick), keyEquivalent: "d"))
         menu.addItem(NSMenuItem.separator())
 
         // 🎨 字体颜色与氛围主题子菜单
@@ -1351,6 +1410,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         vm.reloadCurrent()
     }
 
+    @objc func toggleAlwaysOnTop() {
+        isAlwaysOnTop.toggle()
+    }
+
+    @objc func minimizeWindow() {
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        } else {
+            window.miniaturize(nil)
+        }
+        updateMenu()
+    }
+
     @objc func toggleClickThrough() {
         isClickThrough.toggle()
         window.ignoresMouseEvents = isClickThrough
@@ -1366,11 +1438,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc func toggleWindow() {
-        if window.isVisible {
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+            window.makeKeyAndOrderFront(nil)
+        } else if window.isVisible {
             window.orderOut(nil)
         } else {
             window.makeKeyAndOrderFront(nil)
         }
+        updateMenu()
     }
 
     @objc func reloadLyrics() {
