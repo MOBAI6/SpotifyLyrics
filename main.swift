@@ -153,23 +153,31 @@ enum LyricTheme: String, CaseIterable, Identifiable {
 }
 
 enum LyricFontSizeOption: Double, CaseIterable, Identifiable {
-    case small    = 18.0
-    case medium   = 24.0
-    case standard = 30.0
-    case large    = 40.0
-    case xlarge   = 52.0
-    case huge     = 68.0
+    case compact    = 18.0
+    case small      = 24.0
+    case standard   = 30.0
+    case medium     = 38.0
+    case large      = 48.0
+    case xlarge     = 64.0
+    case tvSmall    = 84.0
+    case tvMedium   = 108.0
+    case tvLarge    = 140.0
+    case tvCinema   = 180.0
 
     var id: Double { rawValue }
 
     var displayName: String {
         switch self {
-        case .small:    return "18 pt (精巧小字 · 容纳更多行)"
-        case .medium:   return "24 pt (适中小字 · 经典视野)"
+        case .compact:  return "18 pt (精巧小字 · 容纳更多行)"
+        case .small:    return "24 pt (适中小字 · 经典视野)"
         case .standard: return "30 pt (标准推荐 · 均衡呼吸)"
-        case .large:    return "40 pt (大字醒目 · 舒适观赏)"
-        case .xlarge:   return "52 pt (超大画卷 · 气势磅礴)"
-        case .huge:     return "68 pt (极限海报 · 巨幕大字)"
+        case .medium:   return "38 pt (大字醒目 · 舒适观赏)"
+        case .large:    return "48 pt (超大画卷 · 气势磅礴)"
+        case .xlarge:   return "64 pt (巨幕海报 · 远距观赏)"
+        case .tvSmall:  return "84 pt (电视小号 · 43-55寸 TV / 2米清晰)"
+        case .tvMedium: return "108 pt (电视标准 · 55-75寸 TV / 3米舒适)"
+        case .tvLarge:  return "140 pt (客厅巨幕 · 75-85寸 TV / 3-5米大字)"
+        case .tvCinema: return "180 pt (影院狂欢 · 85寸+ TV / 投影巨幕)"
         }
     }
 }
@@ -827,7 +835,7 @@ class LyricViewModel: ObservableObject {
         recomputeFontAndLines()
     }
 
-    // 【核心算法重构】：字号真正随用户设置生效 + 高度拉大后自适应铺满更多行数
+    // 【核心算法重构】：字号随用户设置生效 + 覆盖从桌面到电视巨幕 + 高度拉大后自适应铺满更多行数
     private func recomputeFontAndLines() {
         let height = currentWindowHeight
         let baseSize = userSelectedFontSize
@@ -839,17 +847,26 @@ class LyricViewModel: ObservableObject {
             return
         }
 
-        // 以该字号对应的黄金行高槽位 (slotHeight) 自适应推导当前高度能舒适容纳几行
-        let slotHeight = baseSize * 1.48
+        // 黄金行高槽位：大字号(电视模式)紧凑高效以容纳更大字，普通字号保持舒适间距
+        let slotFactor: CGFloat = baseSize >= 80.0 ? 1.35 : 1.48
+        let slotHeight = baseSize * slotFactor
         let rawCount = Int(height / slotHeight)
-        // 保证奇数行居中呈现 (3, 5, 7, 9, 11, 13, 15, 17, 19, 21)
-        let oddCount = (rawCount % 2 == 1) ? rawCount : (rawCount - 1)
-        let targetLines = max(3, min(oddCount, 21))
+
+        let targetLines: Int
+        if rawCount <= 1 {
+            // 高度不足以舒适容纳多行时，自动退化为单行超大字巨幕模式
+            targetLines = 1
+        } else {
+            // 保证奇数行居中呈现 (3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25)
+            let oddCount = (rawCount % 2 == 1) ? rawCount : (rawCount - 1)
+            targetLines = max(3, min(oddCount, 25))
+        }
 
         // 真实行高
         let actualRowHeight = height / CGFloat(targetLines)
-        // 字号严格以用户选择的 baseSize 为主导，并在极小高度时安全微调
-        let finalSize = min(baseSize, actualRowHeight * 0.72)
+        // 字号严格以用户选择的 baseSize 为主导
+        let heightFactor: CGFloat = (targetLines == 1) ? 0.76 : 0.72
+        let finalSize = min(baseSize, actualRowHeight * heightFactor)
 
         if self.displayLineCount != targetLines || abs(self.mainFontSize - finalSize) > 0.3 {
             self.displayLineCount = targetLines
@@ -1132,11 +1149,11 @@ struct LyricFloatingView: View {
         .padding(.vertical, 8)
     }
 
-    // MARK: 悬停迷你控制条 (支持置顶切换、最小化到 Dock、切歌控制)
+    // MARK: 悬停迷你控制条 (支持置顶切换、切歌控制；最小化与关闭使用系统快捷键 ⌘M/⌘W 及右键菜单)
     private var hoverControlsBar: some View {
         HStack(spacing: 12) {
             Spacer()
-            HStack(spacing: 7) {
+            HStack(spacing: 8) {
                 // 窗口置顶切换 (图钉)
                 Button(action: { vm.onToggleAlwaysOnTop?() }) {
                     Image(systemName: vm.isAlwaysOnTop ? "pin.fill" : "pin.slash")
@@ -1145,30 +1162,6 @@ struct LyricFloatingView: View {
                 }
                 .buttonStyle(.plain)
                 .help(vm.isAlwaysOnTop ? "当前：永远置顶 (点击取消置顶)" : "当前：普通层级 (点击开启置顶)")
-
-                // 最小化到 Dock (减号)
-                Button(action: { vm.onMinimizeWindow?() }) {
-                    Image(systemName: "minus")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundColor(.white.opacity(0.85))
-                }
-                .buttonStyle(.plain)
-                .help("最小化歌词窗口到 Dock (⌘M)")
-
-                // 关闭歌词窗口 (叉号)
-                Button(action: {
-                    if NSEvent.modifierFlags.contains(.option) {
-                        vm.onQuitApp?()
-                    } else {
-                        vm.onCloseWindow?()
-                    }
-                }) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundColor(.white.opacity(0.85))
-                }
-                .buttonStyle(.plain)
-                .help("关闭歌词窗口 (⌘W) / 按住 Option 点击彻底退出")
 
                 // 分隔点
                 Circle()
@@ -1265,7 +1258,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.hasShadow = true
 
         window.minSize = NSSize(width: 260, height: 50)
-        window.maxSize = NSSize(width: 1800, height: 1200)
+        window.maxSize = NSSize(width: 8000, height: 5000)
 
         if UserDefaults.standard.string(forKey: "WindowFrame") == nil, let screen = NSScreen.main {
             let screenFrame = screen.visibleFrame
@@ -1356,7 +1349,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func buildAppMenu() -> NSMenu {
         let menu = NSMenu()
         let count = RobustLyricsCache.shared.getCachedCount()
-        let titleItem = NSMenuItem(title: "🎵 Spotify 歌词助手 V5.9", action: nil, keyEquivalent: "")
+        let titleItem = NSMenuItem(title: "🎵 Spotify 歌词助手 V6.0", action: nil, keyEquivalent: "")
         titleItem.isEnabled = false
         menu.addItem(titleItem)
         menu.addItem(NSMenuItem.separator())
