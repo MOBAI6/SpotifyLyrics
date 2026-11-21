@@ -1,6 +1,7 @@
 import Cocoa
 import SwiftUI
 import CryptoKit
+import UserNotifications
 
 // MARK: - 1. 原生繁简转换与元数据清洗
 func toSimplified(_ s: String) -> String {
@@ -749,6 +750,9 @@ class LyricViewModel: ObservableObject {
     private var currentArtist: String = ""
     private var requestToken: UUID = UUID()
 
+    var currentTrackTitle: String { currentTitle }
+    var currentTrackArtist: String { currentArtist }
+
     private var basePosition: Double = 0
     private var baseMediaTime: Double = 0
     private var smoothedOffsetCorrection: Double = 0.0
@@ -1200,6 +1204,946 @@ struct LyricFloatingView: View {
     }
 }
 
+// MARK: - 11. 下载目录管理与配置中枢 (DownloadConfig)
+class DownloadConfig: ObservableObject {
+    static let shared = DownloadConfig()
+    
+    private let userDefaultsKey = "UserDownloadDirectory"
+    
+    @Published var downloadDirectoryURL: URL {
+        didSet {
+            UserDefaults.standard.set(downloadDirectoryURL.path, forKey: userDefaultsKey)
+        }
+    }
+    
+    var downloadDirectoryPath: String {
+        downloadDirectoryURL.path
+    }
+    
+    var displayPath: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if downloadDirectoryPath.hasPrefix(home) {
+            return downloadDirectoryPath.replacingOccurrences(of: home, with: "~")
+        }
+        return downloadDirectoryPath
+    }
+    
+    init() {
+        if let saved = UserDefaults.standard.string(forKey: userDefaultsKey), !saved.isEmpty {
+            self.downloadDirectoryURL = URL(fileURLWithPath: saved)
+        } else {
+            let defaultDir = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Downloads")
+                .appendingPathComponent("Music")
+            self.downloadDirectoryURL = defaultDir
+        }
+        ensureDirectoryExists()
+    }
+    
+    func ensureDirectoryExists() {
+        var isDir: ObjCBool = false
+        if !FileManager.default.fileExists(atPath: downloadDirectoryURL.path, isDirectory: &isDir) || !isDir.boolValue {
+            try? FileManager.default.createDirectory(at: downloadDirectoryURL, withIntermediateDirectories: true)
+        }
+    }
+    
+    func selectDirectory(window: NSWindow? = nil, completion: ((URL?) -> Void)? = nil) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "选择目录"
+        panel.message = "请选择音乐与歌词下载保存目录"
+        
+        let handler: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            if response == .OK, let selectedURL = panel.url {
+                self?.downloadDirectoryURL = selectedURL
+                self?.ensureDirectoryExists()
+                completion?(selectedURL)
+            } else {
+                completion?(nil)
+            }
+        }
+        
+        if let win = window {
+            panel.beginSheetModal(for: win, completionHandler: handler)
+        } else {
+            panel.begin(completionHandler: handler)
+        }
+    }
+    
+    func openInFinder() {
+        ensureDirectoryExists()
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: downloadDirectoryURL.path)
+    }
+    
+    static func cleanFileName(_ string: String) -> String {
+        let invalidCharacters = CharacterSet(charactersIn: ":/\\?*\"<>|")
+        var cleaned = string.components(separatedBy: invalidCharacters).joined(separator: "_")
+        cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleaned.isEmpty {
+            cleaned = "Unknown"
+        }
+        return cleaned
+    }
+}
+
+// 统一系统原生横幅通知分发
+func showSystemBanner(title: String, informativeText: String) {
+    if #available(macOS 10.14, *), let bundleId = Bundle.main.bundleIdentifier, !bundleId.isEmpty {
+        let center = UNUserNotificationCenter.current()
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = informativeText
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        center.add(request, withCompletionHandler: nil)
+    } else if let notifClass = NSClassFromString("NSUserNotification") as? NSObject.Type,
+              let centerClass = NSClassFromString("NSUserNotificationCenter") as? NSObject.Type {
+        let notif = notifClass.init()
+        notif.setValue(title, forKey: "title")
+        notif.setValue(informativeText, forKey: "informativeText")
+        if let defaultCenter = centerClass.value(forKey: "defaultUserNotificationCenter") as? NSObject {
+            defaultCenter.perform(NSSelectorFromString("deliverNotification:"), with: notif)
+        }
+    }
+}
+
+// MARK: - 12. 双轨检索与下载引擎 (SongDownloadEngine)
+struct SearchTrackItem: Identifiable, Equatable {
+    let id: Int
+    let title: String
+    let artist: String
+    let album: String
+    let durationSeconds: Double
+    let qualityTag: String // "FLAC" / "320K" / "HQ"
+    
+    var formattedDuration: String {
+        let m = Int(durationSeconds) / 60
+        let s = Int(durationSeconds) % 60
+        return String(format: "%02d:%02d", m, s)
+    }
+}
+
+enum TrackDownloadStatus: Equatable {
+    case idle
+    case downloading(progressText: String)
+    case completed
+    case failed(error: String)
+}
+
+class SongDownloadEngine: ObservableObject {
+    static let shared = SongDownloadEngine()
+    
+    @Published var activeDownloads: [Int: TrackDownloadStatus] = [:]
+    
+    // 搜索候选曲目列表 (歌名、歌手、专辑、时长、高品质音质标签 320K/FLAC)
+    func searchTracks(query: String, completion: @escaping ([SearchTrackItem]) -> Void) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "https://music.163.com/api/cloudsearch/pc?s=\(encoded)&type=1&limit=20") else {
+            completion([])
+            return
+        }
+        
+        var req = URLRequest(url: url)
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
+        req.timeoutInterval = 6.0
+        
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let result = json["result"] as? [String: Any],
+                  let songs = result["songs"] as? [[String: Any]] else {
+                DispatchQueue.main.async { completion([]) }
+                return
+            }
+            
+            var items: [SearchTrackItem] = []
+            for s in songs {
+                guard let id = s["id"] as? Int,
+                      let name = s["name"] as? String else { continue }
+                
+                var artistName = "未知歌手"
+                if let ars = s["ar"] as? [[String: Any]], !ars.isEmpty {
+                    artistName = ars.compactMap { $0["name"] as? String }.joined(separator: ", ")
+                } else if let ars = s["artists"] as? [[String: Any]], !ars.isEmpty {
+                    artistName = ars.compactMap { $0["name"] as? String }.joined(separator: ", ")
+                }
+                
+                let albumName = (s["al"] as? [String: Any])?["name"] as? String
+                    ?? (s["album"] as? [String: Any])?["name"] as? String
+                    ?? ""
+                
+                let dtMs = s["dt"] as? Double ?? (s["duration"] as? Double ?? 0.0)
+                let durSec = dtMs / 1000.0
+                
+                // 探测最高码率音质标签
+                var qualityTag = "320K"
+                if s["hr"] != nil || s["sq"] != nil {
+                    qualityTag = "FLAC"
+                } else if let priv = s["privilege"] as? [String: Any], let maxbr = priv["maxbr"] as? Int, maxbr >= 999000 {
+                    qualityTag = "FLAC"
+                } else if s["h"] != nil {
+                    qualityTag = "320K"
+                } else if s["m"] != nil {
+                    qualityTag = "192K"
+                } else {
+                    qualityTag = "128K"
+                }
+                
+                items.append(SearchTrackItem(
+                    id: id,
+                    title: name,
+                    artist: artistName,
+                    album: albumName,
+                    durationSeconds: durSec,
+                    qualityTag: qualityTag
+                ))
+            }
+            
+            DispatchQueue.main.async {
+                completion(items)
+            }
+        }.resume()
+    }
+    
+    // 下载曲目 (最高音质音频 + 同步 LRC 歌词)
+    func downloadTrack(item: SearchTrackItem, completion: ((Bool, String) -> Void)? = nil) {
+        DownloadConfig.shared.ensureDirectoryExists()
+        let destDir = DownloadConfig.shared.downloadDirectoryURL
+        
+        DispatchQueue.main.async {
+            self.activeDownloads[item.id] = .downloading(progressText: "获取最高音质链接...")
+        }
+        
+        let safeTitle = DownloadConfig.cleanFileName(item.title)
+        let safeArtist = DownloadConfig.cleanFileName(item.artist)
+        let baseFileName = "\(safeTitle) - \(safeArtist)"
+        
+        // 步骤 1: 请求播放直链 (优先 999000 无损，退化 320000)
+        fetchDirectAudioUrl(id: item.id) { [weak self] audioUrlStr, formatType in
+            guard let self = self else { return }
+            
+            if let audioUrlStr = audioUrlStr, let audioDownloadUrl = URL(string: audioUrlStr) {
+                let ext = (formatType?.lowercased() == "flac" || audioUrlStr.lowercased().contains(".flac")) ? "flac" : "mp3"
+                let audioDestURL = destDir.appendingPathComponent("\(baseFileName).\(ext)")
+                let lrcDestURL = destDir.appendingPathComponent("\(baseFileName).lrc")
+                
+                DispatchQueue.main.async {
+                    self.activeDownloads[item.id] = .downloading(progressText: "正在下载音频与歌词...")
+                }
+                
+                let group = DispatchGroup()
+                var audioSuccess = false
+                
+                // 1. 下载音频
+                group.enter()
+                var req = URLRequest(url: audioDownloadUrl)
+                req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+                req.timeoutInterval = 30.0
+                
+                let downloadTask = URLSession.shared.downloadTask(with: req) { tempURL, response, error in
+                    defer { group.leave() }
+                    guard let tempURL = tempURL, error == nil else { return }
+                    do {
+                        if FileManager.default.fileExists(atPath: audioDestURL.path) {
+                            try FileManager.default.removeItem(at: audioDestURL)
+                        }
+                        try FileManager.default.moveItem(at: tempURL, to: audioDestURL)
+                        audioSuccess = true
+                    } catch {
+                        // 移动文件异常
+                    }
+                }
+                downloadTask.resume()
+                
+                // 2. 获取 LRC 歌词
+                group.enter()
+                self.fetchAndSaveLrc(id: item.id, title: item.title, artist: item.artist, album: item.album, destURL: lrcDestURL) { _ in
+                    group.leave()
+                }
+                
+                group.notify(queue: .main) {
+                    if audioSuccess {
+                        self.activeDownloads[item.id] = .completed
+                        self.notifyDownloadComplete(title: item.title, artist: item.artist, audioURL: audioDestURL, lrcURL: lrcDestURL)
+                        completion?(true, "下载完成")
+                    } else {
+                        // 尝试使用 yt-dlp 兜底
+                        self.fallbackWithYtDlp(title: item.title, artist: item.artist, destDir: destDir, lrcDestURL: lrcDestURL, trackId: item.id, completion: completion)
+                    }
+                }
+            } else {
+                // 网易云无直链（VIP或版权），尝试 yt-dlp 兜底
+                let lrcDestURL = destDir.appendingPathComponent("\(baseFileName).lrc")
+                self.fetchAndSaveLrc(id: item.id, title: item.title, artist: item.artist, album: item.album, destURL: lrcDestURL) { _ in }
+                self.fallbackWithYtDlp(title: item.title, artist: item.artist, destDir: destDir, lrcDestURL: lrcDestURL, trackId: item.id, completion: completion)
+            }
+        }
+    }
+    
+    // 获取网易云最高音质直链
+    private func fetchDirectAudioUrl(id: Int, completion: @escaping (String?, String?) -> Void) {
+        if id <= 0 {
+            completion(nil, nil)
+            return
+        }
+        
+        guard let url999 = URL(string: "https://music.163.com/api/song/enhance/player/url?ids=[\(id)]&br=999000") else {
+            completion(nil, nil)
+            return
+        }
+        var req = URLRequest(url: url999)
+        req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+        req.timeoutInterval = 4.0
+        
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            if let data = data,
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let dataList = json["data"] as? [[String: Any]],
+               let first = dataList.first,
+               let url = first["url"] as? String, !url.isEmpty,
+               (first["code"] as? Int ?? 200) == 200 {
+                let type = first["type"] as? String ?? "mp3"
+                completion(url, type)
+                return
+            }
+            
+            guard let url320 = URL(string: "https://music.163.com/api/song/enhance/player/url?ids=[\(id)]&br=320000") else {
+                completion(nil, nil)
+                return
+            }
+            var req320 = URLRequest(url: url320)
+            req320.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+            req320.timeoutInterval = 4.0
+            
+            URLSession.shared.dataTask(with: req320) { data2, _, _ in
+                if let data2 = data2,
+                   let json2 = try? JSONSerialization.jsonObject(with: data2) as? [String: Any],
+                   let dataList2 = json2["data"] as? [[String: Any]],
+                   let first2 = dataList2.first,
+                   let url2 = first2["url"] as? String, !url2.isEmpty,
+                   (first2["code"] as? Int ?? 200) == 200 {
+                    let type2 = first2["type"] as? String ?? "mp3"
+                    completion(url2, type2)
+                    return
+                }
+                
+                // 最终退化为 outer url
+                let outer = "https://music.163.com/song/media/outer/url?id=\(id).mp3"
+                guard let outerUrl = URL(string: outer) else {
+                    completion(nil, nil)
+                    return
+                }
+                var headReq = URLRequest(url: outerUrl)
+                headReq.httpMethod = "HEAD"
+                headReq.timeoutInterval = 3.0
+                URLSession.shared.dataTask(with: headReq) { _, resp, _ in
+                    if let httpResp = resp as? HTTPURLResponse, httpResp.statusCode == 200 || httpResp.statusCode == 302 {
+                        let finalUrl = httpResp.allHeaderFields["Location"] as? String ?? outer
+                        if !finalUrl.contains("/404") {
+                            completion(finalUrl, "mp3")
+                            return
+                        }
+                    }
+                    completion(nil, nil)
+                }.resume()
+            }.resume()
+        }.resume()
+    }
+    
+    // 抓取并写入格式化 LRC
+    private func fetchAndSaveLrc(id: Int, title: String, artist: String, album: String, destURL: URL, completion: @escaping (Bool) -> Void) {
+        let writeLrcBlock: (String) -> Void = { lrcContent in
+            var header = ""
+            if !lrcContent.contains("[ti:") { header += "[ti:\(title)]\n" }
+            if !lrcContent.contains("[ar:") { header += "[ar:\(artist)]\n" }
+            if !album.isEmpty && !lrcContent.contains("[al:") { header += "[al:\(album)]\n" }
+            
+            let finalLrc = header + lrcContent
+            do {
+                if FileManager.default.fileExists(atPath: destURL.path) {
+                    try FileManager.default.removeItem(at: destURL)
+                }
+                try finalLrc.write(to: destURL, atomically: true, encoding: .utf8)
+                completion(true)
+            } catch {
+                completion(false)
+            }
+        }
+        
+        if id > 0, let lrcApiUrl = URL(string: "https://music.163.com/api/song/lyric?os=pc&id=\(id)&lv=-1&kv=-1&tv=-1") {
+            var req = URLRequest(url: lrcApiUrl)
+            req.timeoutInterval = 4.0
+            
+            URLSession.shared.dataTask(with: req) { data, _, _ in
+                if let data = data,
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let lrcObj = json["lrc"] as? [String: Any],
+                   let text = lrcObj["lyric"] as? String, !text.isEmpty {
+                    writeLrcBlock(text)
+                    return
+                }
+                
+                // 兜底：调用 LyricsEngine
+                LyricsEngine.shared.fetchLyrics(title: title, artist: artist, durationMs: 0) { lines in
+                    if let lines = lines, !lines.isEmpty {
+                        var reconstructed = ""
+                        for l in lines {
+                            let m = Int(l.time) / 60
+                            let s = l.time.truncatingRemainder(dividingBy: 60)
+                            reconstructed += String(format: "[%02d:%05.2f]%@\n", m, s, l.text)
+                        }
+                        writeLrcBlock(reconstructed)
+                    } else {
+                        writeLrcBlock("")
+                    }
+                }
+            }.resume()
+        } else {
+            LyricsEngine.shared.fetchLyrics(title: title, artist: artist, durationMs: 0) { lines in
+                if let lines = lines, !lines.isEmpty {
+                    var reconstructed = ""
+                    for l in lines {
+                        let m = Int(l.time) / 60
+                        let s = l.time.truncatingRemainder(dividingBy: 60)
+                        reconstructed += String(format: "[%02d:%05.2f]%@\n", m, s, l.text)
+                    }
+                    writeLrcBlock(reconstructed)
+                } else {
+                    writeLrcBlock("")
+                }
+            }
+        }
+    }
+    
+    // yt-dlp 兜底下载
+    private func fallbackWithYtDlp(title: String, artist: String, destDir: URL, lrcDestURL: URL, trackId: Int, completion: ((Bool, String) -> Void)?) {
+        guard let ytdlpPath = findYtDlpPath() else {
+            DispatchQueue.main.async {
+                self.activeDownloads[trackId] = .failed(error: "开放音源受版权保护且未检测到本地 yt-dlp 兜底工具")
+                completion?(false, "音源受版权保护且未检测到本地 yt-dlp")
+            }
+            return
+        }
+        
+        DispatchQueue.main.async {
+            self.activeDownloads[trackId] = .downloading(progressText: "开放接口受限，正在通过本地 yt-dlp 兜底...")
+        }
+        
+        DispatchQueue.global(qos: .userInitiated).async {
+            let safeTitle = DownloadConfig.cleanFileName(title)
+            let safeArtist = DownloadConfig.cleanFileName(artist)
+            let audioDestURL = destDir.appendingPathComponent("\(safeTitle) - \(safeArtist).mp3")
+            
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: ytdlpPath)
+            process.arguments = [
+                "-x",
+                "--audio-format", "mp3",
+                "--audio-quality", "0",
+                "-o", audioDestURL.path,
+                "ytsearch1:\(title) \(artist)"
+            ]
+            
+            do {
+                try process.run()
+                process.waitUntilExit()
+                if process.terminationStatus == 0 && FileManager.default.fileExists(atPath: audioDestURL.path) {
+                    DispatchQueue.main.async {
+                        self.activeDownloads[trackId] = .completed
+                        self.notifyDownloadComplete(title: title, artist: artist, audioURL: audioDestURL, lrcURL: lrcDestURL)
+                        completion?(true, "yt-dlp 兜底下载完成")
+                    }
+                } else {
+                    DispatchQueue.main.async {
+                        self.activeDownloads[trackId] = .failed(error: "yt-dlp 执行未成功")
+                        completion?(false, "yt-dlp 执行未成功")
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.activeDownloads[trackId] = .failed(error: error.localizedDescription)
+                    completion?(false, error.localizedDescription)
+                }
+            }
+        }
+    }
+    
+    private func findYtDlpPath() -> String? {
+        let candidates = [
+            "/opt/homebrew/bin/yt-dlp",
+            "/usr/local/bin/yt-dlp",
+            NSString(string: "~/.local/bin/yt-dlp").expandingTildeInPath,
+            "/usr/bin/yt-dlp"
+        ]
+        for c in candidates {
+            if FileManager.default.isExecutableFile(atPath: c) {
+                return c
+            }
+        }
+        return nil
+    }
+    
+    // 下载完成通知与 Finder 高亮定位
+    private func notifyDownloadComplete(title: String, artist: String, audioURL: URL, lrcURL: URL) {
+        showSystemBanner(title: "已完成音乐与歌词下载", informativeText: "\(title) - \(artist)\n已保存至: \(DownloadConfig.shared.displayPath)")
+        
+        var targets: [URL] = []
+        if FileManager.default.fileExists(atPath: audioURL.path) { targets.append(audioURL) }
+        if FileManager.default.fileExists(atPath: lrcURL.path) { targets.append(lrcURL) }
+        if !targets.isEmpty {
+            NSWorkspace.shared.activateFileViewerSelecting(targets)
+        }
+    }
+    
+    // 一键下载当前 Spotify 正在播放曲目
+    func downloadCurrentPlaying(title: String, artist: String, completion: ((Bool, String) -> Void)? = nil) {
+        searchTracks(query: "\(title) \(artist)") { [weak self] items in
+            guard let self = self else { return }
+            if let best = items.first {
+                self.downloadTrack(item: best, completion: completion)
+            } else {
+                let dummy = SearchTrackItem(
+                    id: -1,
+                    title: title,
+                    artist: artist,
+                    album: "",
+                    durationSeconds: 0,
+                    qualityTag: "320K"
+                )
+                self.downloadTrack(item: dummy, completion: completion)
+            }
+        }
+    }
+}
+
+// MARK: - 13. 独立原生音乐搜索与下载窗口 (SearchDownloadView & SearchWindowManager)
+class SearchViewModel: ObservableObject {
+    @Published var keyword: String = ""
+    @Published var isSearching: Bool = false
+    @Published var results: [SearchTrackItem] = []
+    @Published var hasSearched: Bool = false
+    @Published var errorMessage: String? = nil
+    
+    func search() {
+        let trimmed = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        
+        isSearching = true
+        errorMessage = nil
+        hasSearched = true
+        
+        SongDownloadEngine.shared.searchTracks(query: trimmed) { [weak self] items in
+            self?.isSearching = false
+            self?.results = items
+            if items.isEmpty {
+                self?.errorMessage = "未检索到匹配的曲目，请更换关键词重试"
+            }
+        }
+    }
+}
+
+struct SearchDownloadView: View {
+    @StateObject private var vm = SearchViewModel()
+    @ObservedObject private var engine = SongDownloadEngine.shared
+    @ObservedObject private var config = DownloadConfig.shared
+    
+    var body: some View {
+        ZStack {
+            // 毛玻璃背板
+            VisualEffectBackground(material: .hudWindow, blendingMode: .behindWindow, state: .active)
+            
+            VStack(spacing: 0) {
+                // 顶部标题与搜索栏
+                headerSearchBar
+                    .padding(.horizontal, 18)
+                    .padding(.top, 16)
+                    .padding(.bottom, 12)
+                
+                Divider().background(Color.white.opacity(0.12))
+                
+                // 中部列表或提示区
+                contentArea
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                
+                Divider().background(Color.white.opacity(0.12))
+                
+                // 底部目录信息栏
+                footerBar
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+            }
+        }
+        .frame(width: 580, height: 500)
+        .onExitCommand {
+            SearchWindowManager.shared.closeWindow()
+        }
+    }
+    
+    // 顶部搜索栏
+    private var headerSearchBar: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: "music.note.magnifyingglass")
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundColor(Color(red: 0.35, green: 0.95, blue: 0.90))
+                Text("音乐搜索与最高音质双轨下载")
+                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                    .foregroundColor(.white)
+                Spacer()
+                Text("ESC 键关闭")
+                    .font(.system(size: 11, design: .rounded))
+                    .foregroundColor(.white.opacity(0.40))
+            }
+            
+            HStack(spacing: 8) {
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 13))
+                        .foregroundColor(.white.opacity(0.50))
+                    
+                    TextField("输入歌名、歌手或专辑，按回车搜索...", text: $vm.keyword)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13, design: .rounded))
+                        .foregroundColor(.white)
+                        .onSubmit {
+                            vm.search()
+                        }
+                    
+                    if !vm.keyword.isEmpty {
+                        Button(action: { vm.keyword = "" }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 12))
+                                .foregroundColor(.white.opacity(0.50))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.black.opacity(0.35))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                        )
+                )
+                
+                Button(action: { vm.search() }) {
+                    HStack(spacing: 4) {
+                        if vm.isSearching {
+                            ProgressView()
+                                .scaleEffect(0.6)
+                                .frame(width: 14, height: 14)
+                        } else {
+                            Image(systemName: "arrow.right.circle.fill")
+                                .font(.system(size: 13))
+                        }
+                        Text("搜索")
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(Color.blue.opacity(0.80))
+                    .foregroundColor(.white)
+                    .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
+                .disabled(vm.isSearching || vm.keyword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+    }
+    
+    // 内容展示区
+    @ViewBuilder
+    private var contentArea: some View {
+        if vm.isSearching {
+            VStack(spacing: 12) {
+                Spacer()
+                ProgressView()
+                    .scaleEffect(1.1)
+                Text("正在全网检索高品质音轨与 LRC 歌词...")
+                    .font(.system(size: 13, design: .rounded))
+                    .foregroundColor(.white.opacity(0.70))
+                Spacer()
+            }
+        } else if vm.results.isEmpty {
+            VStack(spacing: 10) {
+                Spacer()
+                Image(systemName: vm.hasSearched ? "music.slash" : "sparkles")
+                    .font(.system(size: 36))
+                    .foregroundColor(.white.opacity(0.30))
+                
+                Text(vm.errorMessage ?? (vm.hasSearched ? "未找到相关音乐" : "搜索并一键下载最高音质音频与同步歌词"))
+                    .font(.system(size: 14, weight: .medium, design: .rounded))
+                    .foregroundColor(.white.opacity(0.70))
+                
+                Text("优先下载 FLAC/320K 音轨，自动生成毫秒级同名 .lrc 文件")
+                    .font(.system(size: 12, design: .rounded))
+                    .foregroundColor(.white.opacity(0.40))
+                Spacer()
+            }
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 4) {
+                    ForEach(vm.results) { item in
+                        trackRowView(item: item)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+            }
+        }
+    }
+    
+    // 曲目行项视图
+    private func trackRowView(item: SearchTrackItem) -> some View {
+        let status = engine.activeDownloads[item.id] ?? .idle
+        
+        return HStack(spacing: 10) {
+            Image(systemName: "music.note")
+                .font(.system(size: 14))
+                .foregroundColor(.white.opacity(0.50))
+                .frame(width: 20)
+            
+            VStack(alignment: .leading, spacing: 3) {
+                Text(item.title)
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                
+                HStack(spacing: 6) {
+                    Text(item.artist)
+                        .font(.system(size: 11, design: .rounded))
+                        .foregroundColor(.white.opacity(0.65))
+                        .lineLimit(1)
+                    
+                    if !item.album.isEmpty {
+                        Text("·")
+                            .font(.system(size: 11))
+                            .foregroundColor(.white.opacity(0.40))
+                        Text(item.album)
+                            .font(.system(size: 11, design: .rounded))
+                            .foregroundColor(.white.opacity(0.50))
+                            .lineLimit(1)
+                    }
+                }
+            }
+            
+            Spacer()
+            
+            // 时长
+            Text(item.formattedDuration)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(.white.opacity(0.45))
+                .frame(width: 44, alignment: .trailing)
+            
+            // 音质标签
+            qualityBadge(tag: item.qualityTag)
+            
+            // 下载操作区
+            downloadButton(item: item, status: status)
+                .frame(width: 82, alignment: .trailing)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.white.opacity(0.04))
+        )
+    }
+    
+    // 音质 Badge
+    private func qualityBadge(tag: String) -> some View {
+        let isFlac = tag.uppercased() == "FLAC"
+        let is320 = tag.uppercased() == "320K"
+        
+        let bgColor: Color = isFlac ? Color(red: 0.95, green: 0.60, blue: 0.15) : (is320 ? Color(red: 0.20, green: 0.78, blue: 0.40) : Color.gray.opacity(0.50))
+        let textColor: Color = .white
+        
+        return Text(tag)
+            .font(.system(size: 10, weight: .bold, design: .rounded))
+            .foregroundColor(textColor)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(bgColor.opacity(0.85))
+            .clipShape(Capsule())
+    }
+    
+    // 下载按钮与状态交互
+    @ViewBuilder
+    private func downloadButton(item: SearchTrackItem, status: TrackDownloadStatus) -> some View {
+        switch status {
+        case .idle:
+            Button(action: {
+                engine.downloadTrack(item: item)
+            }) {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .font(.system(size: 12))
+                    Text("下载")
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                }
+                .foregroundColor(.white.opacity(0.90))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.white.opacity(0.12))
+                .cornerRadius(6)
+            }
+            .buttonStyle(.plain)
+            
+        case .downloading(let msg):
+            HStack(spacing: 4) {
+                ProgressView()
+                    .scaleEffect(0.5)
+                    .frame(width: 12, height: 12)
+                Text("下载中")
+                    .font(.system(size: 11, design: .rounded))
+                    .foregroundColor(Color.yellow.opacity(0.90))
+            }
+            .help(msg)
+            
+        case .completed:
+            HStack(spacing: 4) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 12))
+                    .foregroundColor(Color.green)
+                Text("已完成")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundColor(Color.green)
+            }
+            
+        case .failed(let err):
+            Button(action: {
+                engine.downloadTrack(item: item)
+            }) {
+                HStack(spacing: 3) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 11))
+                    Text("重试")
+                        .font(.system(size: 11, design: .rounded))
+                }
+                .foregroundColor(Color.red.opacity(0.90))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(Color.red.opacity(0.15))
+                .cornerRadius(6)
+            }
+            .buttonStyle(.plain)
+            .help("错误: \(err)")
+        }
+    }
+    
+    // 底部状态条
+    private var footerBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "folder")
+                .font(.system(size: 12))
+                .foregroundColor(.white.opacity(0.60))
+            
+            Text("保存目录:")
+                .font(.system(size: 12, design: .rounded))
+                .foregroundColor(.white.opacity(0.60))
+            
+            Button(action: {
+                config.openInFinder()
+            }) {
+                Text(config.displayPath)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(Color(red: 0.35, green: 0.95, blue: 0.90))
+                    .underline()
+            }
+            .buttonStyle(.plain)
+            .help("点击在 Finder 中打开下载目录")
+            
+            Spacer()
+            
+            Button(action: {
+                config.selectDirectory(window: SearchWindowManager.shared.currentWindow)
+            }) {
+                HStack(spacing: 4) {
+                    Image(systemName: "folder.badge.gearshape")
+                        .font(.system(size: 11))
+                    Text("更改目录...")
+                        .font(.system(size: 12, design: .rounded))
+                }
+                .foregroundColor(.white.opacity(0.85))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.white.opacity(0.12))
+                .cornerRadius(6)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+}
+
+// 支持 ESC 键关闭的定制原生窗口
+class SearchWindow: NSWindow {
+    override func cancelOperation(_ sender: Any?) {
+        self.orderOut(nil)
+    }
+    
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 { // ESC 键
+            self.orderOut(nil)
+            return
+        }
+        super.keyDown(with: event)
+    }
+}
+
+// 搜索窗口管理器
+class SearchWindowManager: NSObject, NSWindowDelegate {
+    static let shared = SearchWindowManager()
+    
+    private(set) var currentWindow: NSWindow?
+    
+    func showWindow() {
+        if let win = currentWindow {
+            win.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        
+        let win = SearchWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 580, height: 500),
+            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        win.title = "音乐搜索与下载"
+        win.titleVisibility = .hidden
+        win.titlebarAppearsTransparent = true
+        win.isMovableByWindowBackground = true
+        win.isOpaque = false
+        win.backgroundColor = .clear
+        win.hasShadow = true
+        win.center()
+        win.delegate = self
+        
+        let hostingView = NSHostingView(rootView: SearchDownloadView())
+        win.contentView = hostingView
+        
+        self.currentWindow = win
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    
+    func closeWindow() {
+        currentWindow?.orderOut(nil)
+    }
+    
+    func windowWillClose(_ notification: Notification) {
+        self.currentWindow = nil
+    }
+}
+
 // MARK: - 10. 主应用控制器与状态栏菜单
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: NSWindow!
@@ -1292,6 +2236,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.contentView = hv
         window.makeKeyAndOrderFront(nil)
 
+        // 注册局部/全局快捷键监听：⌘F 打开搜索窗口，⌘S 下载当前播放曲目
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            if event.modifierFlags.contains(.command) {
+                let key = event.charactersIgnoringModifiers?.lowercased()
+                if key == "f" {
+                    self?.openSearchWindow()
+                    return nil
+                } else if key == "s" {
+                    self?.downloadCurrentTrackAction()
+                    return nil
+                }
+            }
+            return event
+        }
+
         vm.updateDimensions(width: window.frame.width, height: window.frame.height)
     }
 
@@ -1354,6 +2313,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(titleItem)
         menu.addItem(NSMenuItem.separator())
 
+        // 🔍 音乐搜索与双轨下载入口 (⌘F)
+        menu.addItem(NSMenuItem(title: "🔍 搜索并下载音乐... (⌘F)", action: #selector(openSearchWindow), keyEquivalent: "f"))
+        
+        // ⬇️ 下载当前播放曲目 (⌘S)
+        let curTitle = vm.currentTrackTitle
+        let curArtist = vm.currentTrackArtist
+        let downloadTitle = curTitle.isEmpty ? "⬇️ 下载当前播放曲目 (⌘S)" : "⬇️ 下载当前歌曲: \(curTitle) - \(curArtist) (⌘S)"
+        menu.addItem(NSMenuItem(title: downloadTitle, action: #selector(downloadCurrentTrackAction), keyEquivalent: "s"))
+        menu.addItem(NSMenuItem.separator())
+
         let isShown = window != nil && window.isVisible && !window.isMiniaturized
         if isShown {
             menu.addItem(NSMenuItem(title: "关闭歌词窗口 (隐藏到后台)", action: #selector(closeWindow), keyEquivalent: "w"))
@@ -1404,6 +2373,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let glassItem = NSMenuItem(title: glassTitle, action: #selector(toggleGlassAction), keyEquivalent: "")
         menu.addItem(glassItem)
 
+        menu.addItem(NSMenuItem.separator())
+        // 📁 音乐存储目录管理
+        let dirTitle = "📁 存储目录: \(DownloadConfig.shared.displayPath)"
+        menu.addItem(NSMenuItem(title: dirTitle, action: #selector(openDownloadFolder), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "⚙️ 更改音乐保存目录...", action: #selector(changeDownloadFolder), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "🔄 强制重新拉取当前歌词", action: #selector(reloadLyrics), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "🗑 清除本地歌词缓存 (已缓存 \(count) 首)", action: #selector(clearLyricsCache), keyEquivalent: ""))
@@ -1504,6 +2478,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc func quitApp() {
         NSApplication.shared.terminate(nil)
+    }
+
+    @objc func openSearchWindow() {
+        SearchWindowManager.shared.showWindow()
+    }
+
+    @objc func downloadCurrentTrackAction() {
+        let title = vm.currentTrackTitle
+        let artist = vm.currentTrackArtist
+        guard !title.isEmpty else {
+            showSystemBanner(title: "未检测到播放曲目", informativeText: "请先在 Spotify 中播放歌曲，或使用 ⌘F 搜索下载。")
+            return
+        }
+        
+        showSystemBanner(title: "开始下载当前曲目", informativeText: "正在检索 \(title) - \(artist) 的最高音质音轨与歌词...")
+        
+        SongDownloadEngine.shared.downloadCurrentPlaying(title: title, artist: artist) { success, msg in
+            if !success {
+                showSystemBanner(title: "下载未成功", informativeText: "\(title) - \(artist)\n提示: \(msg)")
+            }
+        }
+    }
+
+    @objc func openDownloadFolder() {
+        DownloadConfig.shared.openInFinder()
+    }
+
+    @objc func changeDownloadFolder() {
+        DownloadConfig.shared.selectDirectory(window: window) { [weak self] _ in
+            self?.updateMenu()
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
