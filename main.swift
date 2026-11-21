@@ -1410,6 +1410,20 @@ class SongDownloadEngine: ObservableObject {
         }.resume()
     }
     
+    // MARK: - 内部重定向捕获 Delegate
+    private class RedirectCatchDelegate: NSObject, URLSessionTaskDelegate {
+        var redirectedURLString: String?
+        
+        func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+            if let location = response.allHeaderFields["Location"] as? String ?? response.allHeaderFields["location"] as? String {
+                self.redirectedURLString = location
+            } else if let url = request.url?.absoluteString {
+                self.redirectedURLString = url
+            }
+            completionHandler(nil)
+        }
+    }
+    
     // 下载曲目 (最高音质音频 + 同步 LRC 歌词)
     func downloadTrack(item: SearchTrackItem, completion: ((Bool, String) -> Void)? = nil) {
         DownloadConfig.shared.ensureDirectoryExists()
@@ -1422,37 +1436,47 @@ class SongDownloadEngine: ObservableObject {
         let safeTitle = DownloadConfig.cleanFileName(item.title)
         let safeArtist = DownloadConfig.cleanFileName(item.artist)
         let baseFileName = "\(safeTitle) - \(safeArtist)"
+        let lrcDestURL = destDir.appendingPathComponent("\(baseFileName).lrc")
         
-        // 步骤 1: 请求播放直链 (优先 999000 无损，退化 320000)
+        // 步骤 1: 请求播放直链 (通道 1 Meting 302 -> 通道 2 Paugram -> 通道 3 Meting 跟随下载)
         fetchDirectAudioUrl(id: item.id) { [weak self] audioUrlStr, formatType in
             guard let self = self else { return }
             
             if let audioUrlStr = audioUrlStr, let audioDownloadUrl = URL(string: audioUrlStr) {
-                let ext = (formatType?.lowercased() == "flac" || audioUrlStr.lowercased().contains(".flac")) ? "flac" : "mp3"
-                let audioDestURL = destDir.appendingPathComponent("\(baseFileName).\(ext)")
-                let lrcDestURL = destDir.appendingPathComponent("\(baseFileName).lrc")
-                
                 DispatchQueue.main.async {
                     self.activeDownloads[item.id] = .downloading(progressText: "正在下载音频与歌词...")
                 }
                 
                 let group = DispatchGroup()
                 var audioSuccess = false
+                var finalAudioURL: URL? = nil
                 
                 // 1. 下载音频
                 group.enter()
                 var req = URLRequest(url: audioDownloadUrl)
-                req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-                req.timeoutInterval = 30.0
+                req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
+                req.timeoutInterval = 45.0
                 
                 let downloadTask = URLSession.shared.downloadTask(with: req) { tempURL, response, error in
                     defer { group.leave() }
                     guard let tempURL = tempURL, error == nil else { return }
+                    
+                    // 校验临时文件大小必须 > 100KB (防止下到 404 错误页或空文件)
+                    let fileSize = (try? FileManager.default.attributesOfItem(atPath: tempURL.path)[.size] as? Int64) ?? 0
+                    guard fileSize > 100 * 1024 else {
+                        return
+                    }
+                    
+                    // 通过文件头魔数或 response 确定扩展名 (.mp3 或 .flac)
+                    let ext = self.detectAudioExtension(fileURL: tempURL, response: response, fallbackFormat: formatType)
+                    let audioDestURL = destDir.appendingPathComponent("\(baseFileName).\(ext)")
+                    
                     do {
                         if FileManager.default.fileExists(atPath: audioDestURL.path) {
                             try FileManager.default.removeItem(at: audioDestURL)
                         }
                         try FileManager.default.moveItem(at: tempURL, to: audioDestURL)
+                        finalAudioURL = audioDestURL
                         audioSuccess = true
                     } catch {
                         // 移动文件异常
@@ -1467,92 +1491,128 @@ class SongDownloadEngine: ObservableObject {
                 }
                 
                 group.notify(queue: .main) {
-                    if audioSuccess {
+                    if audioSuccess, let audioURL = finalAudioURL {
                         self.activeDownloads[item.id] = .completed
-                        self.notifyDownloadComplete(title: item.title, artist: item.artist, audioURL: audioDestURL, lrcURL: lrcDestURL)
+                        self.notifyDownloadComplete(title: item.title, artist: item.artist, audioURL: audioURL, lrcURL: lrcDestURL)
                         completion?(true, "下载完成")
                     } else {
-                        // 尝试使用 yt-dlp 兜底
+                        // 音频直链下载未达标或失败，尝试使用本地 yt-dlp 兜底
                         self.fallbackWithYtDlp(title: item.title, artist: item.artist, destDir: destDir, lrcDestURL: lrcDestURL, trackId: item.id, completion: completion)
                     }
                 }
             } else {
-                // 网易云无直链（VIP或版权），尝试 yt-dlp 兜底
-                let lrcDestURL = destDir.appendingPathComponent("\(baseFileName).lrc")
+                // 音频链接获取失败，预先保存歌词并尝试 yt-dlp 兜底
                 self.fetchAndSaveLrc(id: item.id, title: item.title, artist: item.artist, album: item.album, destURL: lrcDestURL) { _ in }
                 self.fallbackWithYtDlp(title: item.title, artist: item.artist, destDir: destDir, lrcDestURL: lrcDestURL, trackId: item.id, completion: completion)
             }
         }
     }
     
-    // 获取网易云最高音质直链
+    // 获取音频直链 (三通道架构: 通道 1 Meting 302 -> 通道 2 Paugram -> 通道 3 Meting 原链自动跟随)
     private func fetchDirectAudioUrl(id: Int, completion: @escaping (String?, String?) -> Void) {
         if id <= 0 {
             completion(nil, nil)
             return
         }
         
-        guard let url999 = URL(string: "https://music.163.com/api/song/enhance/player/url?ids=[\(id)]&br=999000") else {
+        let metingUrlStr = "https://api.injahow.cn/meting/?type=url&id=\(id)"
+        guard let metingUrl = URL(string: metingUrlStr) else {
             completion(nil, nil)
             return
         }
-        var req = URLRequest(url: url999)
-        req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-        req.timeoutInterval = 4.0
         
-        URLSession.shared.dataTask(with: req) { data, _, _ in
-            if let data = data,
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let dataList = json["data"] as? [[String: Any]],
-               let first = dataList.first,
-               let url = first["url"] as? String, !url.isEmpty,
-               (first["code"] as? Int ?? 200) == 200 {
-                let type = first["type"] as? String ?? "mp3"
-                completion(url, type)
+        // 通道 1: Meting 直链解析接口捕获 302 重定向后的真实 Location
+        let delegate = RedirectCatchDelegate()
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        var headReq = URLRequest(url: metingUrl)
+        headReq.httpMethod = "HEAD"
+        headReq.timeoutInterval = 4.0
+        headReq.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
+        
+        session.dataTask(with: headReq) { [weak self] _, resp, _ in
+            guard let self = self else { return }
+            
+            let location = delegate.redirectedURLString
+                ?? (resp as? HTTPURLResponse)?.allHeaderFields["Location"] as? String
+                ?? (resp as? HTTPURLResponse)?.allHeaderFields["location"] as? String
+            
+            if let loc = location, !loc.isEmpty, !loc.contains("404"), loc.hasPrefix("http") {
+                let ext = loc.lowercased().contains(".flac") ? "flac" : "mp3"
+                completion(loc, ext)
                 return
             }
             
-            guard let url320 = URL(string: "https://music.163.com/api/song/enhance/player/url?ids=[\(id)]&br=320000") else {
-                completion(nil, nil)
-                return
-            }
-            var req320 = URLRequest(url: url320)
-            req320.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-            req320.timeoutInterval = 4.0
-            
-            URLSession.shared.dataTask(with: req320) { data2, _, _ in
-                if let data2 = data2,
-                   let json2 = try? JSONSerialization.jsonObject(with: data2) as? [String: Any],
-                   let dataList2 = json2["data"] as? [[String: Any]],
-                   let first2 = dataList2.first,
-                   let url2 = first2["url"] as? String, !url2.isEmpty,
-                   (first2["code"] as? Int ?? 200) == 200 {
-                    let type2 = first2["type"] as? String ?? "mp3"
-                    completion(url2, type2)
+            // 通道 2: Paugram 备用接口获取 link
+            self.fetchPaugramAudioUrl(id: id) { paugramLink in
+                if let link = paugramLink, !link.isEmpty, !link.contains("404"), link.hasPrefix("http") {
+                    let ext = link.lowercased().contains(".flac") ? "flac" : "mp3"
+                    completion(link, ext)
                     return
                 }
                 
-                // 最终退化为 outer url
-                let outer = "https://music.163.com/song/media/outer/url?id=\(id).mp3"
-                guard let outerUrl = URL(string: outer) else {
-                    completion(nil, nil)
-                    return
-                }
-                var headReq = URLRequest(url: outerUrl)
-                headReq.httpMethod = "HEAD"
-                headReq.timeoutInterval = 3.0
-                URLSession.shared.dataTask(with: headReq) { _, resp, _ in
-                    if let httpResp = resp as? HTTPURLResponse, httpResp.statusCode == 200 || httpResp.statusCode == 302 {
-                        let finalUrl = httpResp.allHeaderFields["Location"] as? String ?? outer
-                        if !finalUrl.contains("/404") {
-                            completion(finalUrl, "mp3")
-                            return
-                        }
-                    }
-                    completion(nil, nil)
-                }.resume()
-            }.resume()
+                // 通道 3: Meting 直链原地址交由 URLSession 自动跟随 302 重定向下载
+                completion(metingUrlStr, "mp3")
+            }
         }.resume()
+    }
+    
+    // 通道 2: Paugram 备用接口解析
+    private func fetchPaugramAudioUrl(id: Int, completion: @escaping (String?) -> Void) {
+        guard let paugramUrl = URL(string: "https://api.paugram.com/netease/?id=\(id)") else {
+            completion(nil)
+            return
+        }
+        var req = URLRequest(url: paugramUrl)
+        req.timeoutInterval = 4.0
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
+        
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let link = json["link"] as? String,
+                  !link.isEmpty,
+                  !link.contains("404"),
+                  link.hasPrefix("http") else {
+                completion(nil)
+                return
+            }
+            completion(link)
+        }.resume()
+    }
+    
+    // 通过文件头魔数或 HTTP 响应判定音频扩展名 (.mp3 或 .flac)
+    private func detectAudioExtension(fileURL: URL, response: URLResponse?, fallbackFormat: String?) -> String {
+        // 1. 读取文件头前 4 字节魔数判定 FLAC
+        if let fileHandle = try? FileHandle(forReadingFrom: fileURL) {
+            defer { try? fileHandle.close() }
+            let headerData = fileHandle.readData(ofLength: 4)
+            // FLAC 格式魔数: 0x66 0x4C 0x61 0x43 ("fLaC")
+            if headerData.count >= 4 && headerData.starts(with: [0x66, 0x4C, 0x61, 0x43]) {
+                return "flac"
+            }
+        }
+        
+        // 2. 检查 HTTP 响应 MIME 类型
+        if let mime = response?.mimeType?.lowercased() {
+            if mime.contains("flac") {
+                return "flac"
+            } else if mime.contains("mpeg") || mime.contains("mp3") {
+                return "mp3"
+            }
+        }
+        
+        // 3. 检查重定向后的实际 URL 路径后缀
+        if let respUrl = response?.url?.pathExtension.lowercased(), !respUrl.isEmpty {
+            if respUrl == "flac" { return "flac" }
+            if respUrl == "mp3" { return "mp3" }
+        }
+        
+        // 4. 检查 fallbackFormat
+        if let fallback = fallbackFormat?.lowercased(), fallback == "flac" {
+            return "flac"
+        }
+        
+        return "mp3"
     }
     
     // 抓取并写入格式化 LRC
@@ -1674,12 +1734,22 @@ class SongDownloadEngine: ObservableObject {
     }
     
     private func findYtDlpPath() -> String? {
-        let candidates = [
+        var candidates = [
             "/opt/homebrew/bin/yt-dlp",
             "/usr/local/bin/yt-dlp",
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/yt-dlp").path,
             NSString(string: "~/.local/bin/yt-dlp").expandingTildeInPath,
-            "/usr/bin/yt-dlp"
+            "/usr/bin/yt-dlp",
+            "/bin/yt-dlp"
         ]
+        if let home = ProcessInfo.processInfo.environment["HOME"] {
+            candidates.append("\(home)/.local/bin/yt-dlp")
+        }
+        if let pathEnv = ProcessInfo.processInfo.environment["PATH"] {
+            for dir in pathEnv.components(separatedBy: ":") where !dir.isEmpty {
+                candidates.append("\(dir)/yt-dlp")
+            }
+        }
         for c in candidates {
             if FileManager.default.isExecutableFile(atPath: c) {
                 return c
