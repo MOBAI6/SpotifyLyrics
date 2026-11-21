@@ -733,6 +733,8 @@ class LyricViewModel: ObservableObject {
 
     var onToggleAlwaysOnTop: (() -> Void)?
     var onMinimizeWindow: (() -> Void)?
+    var onCloseWindow: (() -> Void)?
+    var onQuitApp: (() -> Void)?
 
     private var lastTrackKey: String = ""
     private var currentTitle: String = ""
@@ -1153,6 +1155,21 @@ struct LyricFloatingView: View {
                 .buttonStyle(.plain)
                 .help("最小化歌词窗口到 Dock (⌘M)")
 
+                // 关闭歌词窗口 (叉号)
+                Button(action: {
+                    if NSEvent.modifierFlags.contains(.option) {
+                        vm.onQuitApp?()
+                    } else {
+                        vm.onCloseWindow?()
+                    }
+                }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(.white.opacity(0.85))
+                }
+                .buttonStyle(.plain)
+                .help("关闭歌词窗口 (⌘W) / 按住 Option 点击彻底退出")
+
                 // 分隔点
                 Circle()
                     .fill(Color.white.opacity(0.30))
@@ -1194,6 +1211,7 @@ struct LyricFloatingView: View {
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: NSWindow!
     var statusItem: NSStatusItem!
+    var hostingView: NSHostingView<LyricFloatingView>?
     let vm = LyricViewModel()
     var timer: Timer?
 
@@ -1232,7 +1250,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         window = NSWindow(
             contentRect: initialRect,
-            styleMask: [.titled, .resizable, .miniaturizable, .fullSizeContentView],
+            styleMask: [.titled, .resizable, .miniaturizable, .closable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
@@ -1264,14 +1282,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         vm.onMinimizeWindow = { [weak self] in
             self?.minimizeWindow()
         }
+        vm.onCloseWindow = { [weak self] in
+            self?.closeWindow()
+        }
+        vm.onQuitApp = { [weak self] in
+            self?.quitApp()
+        }
 
         let doubleClickGesture = NSClickGestureRecognizer(target: self, action: #selector(handleDoubleClick))
         doubleClickGesture.numberOfClicksRequired = 2
 
-        let hostingView = NSHostingView(rootView: LyricFloatingView(vm: vm))
-        hostingView.addGestureRecognizer(doubleClickGesture)
+        let hv = NSHostingView(rootView: LyricFloatingView(vm: vm))
+        hv.addGestureRecognizer(doubleClickGesture)
+        self.hostingView = hv
 
-        window.contentView = hostingView
+        window.contentView = hv
         window.makeKeyAndOrderFront(nil)
 
         vm.updateDimensions(width: window.frame.width, height: window.frame.height)
@@ -1324,19 +1349,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func updateMenu() {
+        statusItem.menu = buildAppMenu()
+        hostingView?.menu = buildAppMenu()
+    }
+
+    private func buildAppMenu() -> NSMenu {
         let menu = NSMenu()
         let count = RobustLyricsCache.shared.getCachedCount()
-        let titleItem = NSMenuItem(title: "🎵 Spotify 歌词助手 V5.8", action: nil, keyEquivalent: "")
+        let titleItem = NSMenuItem(title: "🎵 Spotify 歌词助手 V5.9", action: nil, keyEquivalent: "")
         titleItem.isEnabled = false
         menu.addItem(titleItem)
         menu.addItem(NSMenuItem.separator())
+
+        let isShown = window != nil && window.isVisible && !window.isMiniaturized
+        if isShown {
+            menu.addItem(NSMenuItem(title: "关闭歌词窗口 (隐藏到后台)", action: #selector(closeWindow), keyEquivalent: "w"))
+        } else {
+            menu.addItem(NSMenuItem(title: "打开 / 恢复歌词窗口", action: #selector(toggleWindow), keyEquivalent: "w"))
+        }
 
         menu.addItem(NSMenuItem(title: "显示 / 隐藏 桌面歌词", action: #selector(toggleWindow), keyEquivalent: "h"))
 
         let topTitle = isAlwaysOnTop ? "✓ 窗口永远置顶 (已开启)" : "开启窗口永远置顶模式"
         menu.addItem(NSMenuItem(title: topTitle, action: #selector(toggleAlwaysOnTop), keyEquivalent: "t"))
 
-        let miniTitle = window.isMiniaturized ? "从 Dock 恢复歌词窗口" : "最小化歌词窗口到 Dock"
+        let miniTitle = (window != nil && window.isMiniaturized) ? "从 Dock 恢复歌词窗口" : "最小化歌词窗口到 Dock"
         menu.addItem(NSMenuItem(title: miniTitle, action: #selector(minimizeWindow), keyEquivalent: "m"))
 
         let clickThroughTitle = isClickThrough ? "✓ 鼠标点击穿透模式 (已开启)" : "开启鼠标点击穿透模式"
@@ -1381,7 +1418,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "退出 SpotifyLyrics", action: #selector(quitApp), keyEquivalent: "q"))
 
-        statusItem.menu = menu
+        return menu
     }
 
     @objc func changeFontSizeAction(_ sender: NSMenuItem) {
@@ -1420,6 +1457,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else {
             window.miniaturize(nil)
         }
+        updateMenu()
+    }
+
+    @objc func closeWindow() {
+        window.orderOut(nil)
         updateMenu()
     }
 
@@ -1473,6 +1515,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return false
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            if window.isMiniaturized {
+                window.deminiaturize(nil)
+            }
+            window.makeKeyAndOrderFront(nil)
+            updateMenu()
+        }
+        return true
     }
 }
 
