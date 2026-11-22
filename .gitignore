@@ -13,3 +13,9 @@ DerivedData/
 # Logs & Temporary
 *.log
 .mimosa/
+
+# Local private sources & extensions (STRICTLY FORBIDDEN IN GIT)
+*sources*.json
+*.private.json
+.spotifylyrics/
+sources.local.json

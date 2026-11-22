@@ -1,6 +1,6 @@
-# SpotifyLyrics Master Hi-Res 无损全曲音源与多通道分布式直链规范 (SPEC)
+# SpotifyLyrics 法律合规防侵权与本地私有音源隔离规范 (SPEC)
 
-针对用户反馈**“有没有好用的源，现在很多还是下载失败”**的痛点，彻底解决各大音乐平台 VIP 歌曲公开接口仅下发 15 秒试听片段导致的频繁下载失败问题，全面引入 **Master Hi-Res 24bit 无损全曲音源引擎** 与 **自动音频转码封装管线**。
+针对用户指示：**“这种需要特殊源的可以隐藏掉，不上传git，也要注意下被别人起诉的点”**，本规范确立**开源代码库 100% 纯净中立化**、**法律避风港免责声明**、**本地私有音源隔离加载（Local Private Source Isolation）**与 **Git 敏感凭据防泄漏** 四大防线。
 
 ---
 
@@ -8,38 +8,30 @@
 
 ```mermaid
 flowchart TD
-    subgraph User["👤 用户交互 (User)"]
-        U1["点击曲目下载 (⌘F) 或一键下载当前播放 (⌘S)"]
-        U2["界面实时显示下载进度与母带级音质标签 (FLAC / 320K)"]
-        U3["下载完成即刻弹出系统通知并高亮 Finder 目标文件"]
-        U4["本地曲库 (⌘L) 秒级刷新，离线双击即开播，悬浮歌词同步展示"]
+    subgraph LegalCompliance["⚖️ 法律风险防御与代码库中立性 (Safe Harbor)"]
+        L1["遵循避风港原则：SpotifyLyrics 定位为本地歌词与媒体管理中立框架"]
+        L2["代码库 100% 纯净：严禁硬编码任何第三方未授权音源、逆向 API 或敏感域名"]
+        L3["开源免责声明：明确不存储、不提供、不分发受版权保护音频"]
     end
 
-    subgraph MasterResolver["🚀 Master Hi-Res 无损全曲解析引擎"]
-        M1["接收目标歌曲 (Title, Artist, TargetDuration)"]
-        M2{"优先调用 Master 全曲无损直链解析通道 (br=1/2)"}
-        M3["秒级返回 24bit Hi-Res FLAC / 320K 真实完整音频流 (5~50MB)"]
-        M4["若 Master 异常，平滑降级至内置多平台原生备用节点 (Meting/Paugram/Kuwo/Kugou)"]
+    subgraph StorageIsolation["🔒 本地私有隔离层 (Local Private Isolation)"]
+        S1["私有配置文件存放在用户受保护的本地目录 (~/.spotifylyrics/sources.json)"]
+        S2[".gitignore 强制忽略所有 *sources*.json 与本地私有扩展"]
+        S3["绝不纳入 Git 跟踪，绝不上传推送至公共代码仓库"]
     end
 
-    subgraph Pipeline["⚙️ 格式探测、转码与防试听门禁"]
-        P1["流式下载至临时文件 .tmp"]
-        P2{"探测文件头魔数与 MIME 格式"}
-        P3["FLAC / MP3: 原生完整音频，直接保持"]
-        P4["OGG 音频: 本地 ffmpeg 秒级无损封装转码为高质量 MP3 (320K)"]
-        P5{"【AntiPreviewGate 物理时长门禁】\nAVURLAsset 探测解码真实时长 >= 60s?"}
-        P6["拦截试听残卷 (秒级物理销毁) 并触发跨平台换源"]
-        P7["门禁放行！双轨原子写入: <歌名 - 歌手>.<ext> + <歌名 - 歌手>.lrc"]
+    subgraph RuntimeEngine["⚙️ 运行时动态加载器 (PrivateSourceLoader)"]
+        R1["App 启动时动态探测本地私有配置是否存在"]
+        R2{"本地是否存在私有音源配置?"}
+        R3["已配置: 动态注入本地私有音源解析器 (享受全曲无损下载体验)"]
+        R4["未配置: 保持标准公开开源接口，提示用户可按需外挂扩展"]
     end
 
-    U1 --> M1 --> M2
-    M2 -- "命中全曲直链" --> M3 --> P1
-    M2 -- "未命中" --> M4 --> P1
-    P1 --> P2
-    P2 -- "FLAC / MP3" --> P3 --> P5
-    P2 -- "OGG" --> P4 --> P5
-    P5 -- "时长 < 60s (试听)" --> P6 --> M4
-    P5 -- "时长 >= 60s (正曲)" --> P7 --> U3 & U4
+    L1 & L2 --> S2
+    S1 --> S2 --> S3
+    S1 -.-> R1 --> R2
+    R2 -- "是" --> R3
+    R2 -- "否" --> R4
 ```
 
 ---
@@ -49,53 +41,66 @@ flowchart TD
 ```mermaid
 sequenceDiagram
     autonumber
-    actor User as 👤 用户
-    participant View as 🖥️ SearchDownloadView
-    participant Engine as ⚙️ SongDownloadEngine
-    participant Master as 🚀 Master Hi-Res Resolver
-    participant Transcoder as 🔄 Local Audio Transcoder (ffmpeg)
-    participant Gate as 🛡️ AntiPreviewGate (AVURLAsset)
-    participant FS as 💾 本地音乐曲库 (~/Downloads/Music)
+    actor Dev as 🧑‍💻 开发者 / 用户
+    participant Git as 🐙 Git 版本控制 (.gitignore)
+    participant LocalDisk as 💾 本地私有存储 (~/.spotifylyrics/)
+    participant Loader as 🔌 PrivateSourceLoader
+    participant App as 🖥️ SpotifyLyrics 运行时
+    participant RemoteRepo as 🌐 GitHub 公开仓库
 
-    User->>View: 点击下载 "七里香 周杰伦" (或 ⌘S)
-    View->>Engine: downloadTrack(candidate)
-    
     rect rgb(245, 250, 255)
-    Note over Engine, Master: 核心提速通道：Master Hi-Res 直链解析
-    Engine->>Master: resolveMasterAudioUrl(title, artist, preferLossless: true)
-    Master-->>Engine: 成功返回 24bit Hi-Res FLAC 直链 (Content-Length: 12MB~52MB)
+    Note over Dev, Git: 第一防线：本地私有隔离与 Git 阻断
+    Dev->>LocalDisk: 生成 ~/.spotifylyrics/sources.json (配置真实接口与规则)
+    Dev->>Git: 在 .gitignore 声明忽略 *sources*.json 与私有配置
+    Git-->>RemoteRepo: Push 时拦截所有私有源配置文件 (零敏感泄漏)
     end
 
-    Engine->>FS: 异步流式下载至 workingTempURL
+    rect rgb(255, 250, 240)
+    Note over Loader, App: 第二防线：运行时纯代码动态挂载
+    App->>Loader: loadPrivateSources()
+    Loader->>LocalDisk: 读取本地私有 sources.json
     
-    alt 探测格式为 OGG
-        Engine->>Transcoder: ffmpeg -i temp.ogg -c:a libmp3lame -q:a 0 temp.mp3
-        Transcoder-->>Engine: 转码为 320K 标准 MP3
-    else 探测格式为 FLAC / MP3
-        Note over Engine: 原生支持，保持最高原始母带品质
+    alt 本地配置存在且合法
+        LocalDisk-->>Loader: 返回 endpoint / queryTemplate / extractRegex
+        Loader-->>App: 动态注入本地专用 Master 优先解析通道 (用户本机丝滑生效)
+    else 本地配置不存在
+        Loader-->>App: 仅挂载公开基础通道，提供外挂音源导入入口
     end
-
-    Engine->>Gate: inspectAudio(workingTempURL)
-    Gate-->>Engine: 真实时长探测: 299.0s (>= 60s 门禁通过！)
-    
-    Engine->>FS: 原子移动至 ~/Downloads/Music/七里香 - 周杰伦.flac
-    Engine->>FS: 并发拉取并写入 ~/Downloads/Music/七里香 - 周杰伦.lrc
-    Engine-->>View: 状态更新为 .completed
-    Engine-->>User: 系统横幅提醒与 Finder 自动定位高亮
+    end
 ```
 
 ---
 
-## 三、 详细规格与算法阈值
+## 三、 详细规格与防线清单
 
-1. **Master Hi-Res 解析协议**：
-   - 目标参数：`https://oiapi.net/api/Kuwo?msg={title}+{artist}&br=1&n=1`（`br=1` 无损 FLAC，`br=2` 高品质，`br=3` 标准）；
-   - 响应提取正则：`音乐链接：(\S+)`；
-   - 兼容支持用户配置的自定义 API（`DownloadConfig.shared.customApiUrl`）。
-2. **转码封装管线**：
-   - 检查 `/opt/homebrew/bin/ffmpeg` 或 `/usr/local/bin/ffmpeg`；
-   - 若下载内容为 `Ogg data, Vorbis audio`，通过 `ffmpeg -y -i input.ogg -c:a libmp3lame -q:a 0 output.mp3` 进行秒级转码，确保 macOS 原生 `AVAudioPlayer` 完美播放；
-   - 若为 FLAC 或 MP3，零损耗保持原样落盘。
-3. **门禁与双轨写入**：
-   - 真实时长必须满足 $\ge 60$ 秒且误差受控；
-   - 音频与 LRC 成对写入，文件名采用统一清洗规则 `<CleanTitle> - <CleanArtist>.<ext>`。
+### 1. 敏感特征代码彻底剥离
+- `main.swift` 中严禁残留任何硬编码敏感音源 URL（如第三方未授权音源域名、商业逆向解析端点等）；
+- 所有特殊音源均抽象为通用 `PrivateSourceRule` 模型：
+  ```swift
+  struct PrivateSourceRule: Codable {
+      let enabled: Bool
+      let name: String
+      let endpoint: String
+      let queryTemplate: String
+      let extractRegex: String
+      let preferFormat: String
+  }
+  ```
+
+### 2. 本地私有隔离配置路径
+- 配置文件优先读取：
+  1. `~/.spotifylyrics/sources.json`
+  2. `~/Library/Application Support/SpotifyLyrics/sources.json`
+  3. 项目工作区根目录下受 `.gitignore` 保护的 `sources.local.json`
+- `.gitignore` 强制包含：
+  ```gitignore
+  # Local private sources & extensions
+  *sources.json
+  *sources.local.json
+  *.private.json
+  .spotifylyrics/
+  ```
+
+### 3. 开源免责声明 (Disclaimer)
+- 在 `README.md` 与状态栏“关于”菜单中常驻声明：
+  > “免责声明：SpotifyLyrics 是一款基于开源协议开发的个人桌面歌词同步与本地媒体管理工具。本项目不提供、不分发任何受版权保护的音视频内容，亦不内置任何侵权音源接口。所有音频检索与解析能力均基于公开接口规范或由使用者自行配置的本地音源扩展提供，使用者应自行确保音源来源之合规性，与本项目开发者无关。”

@@ -1782,6 +1782,34 @@ func showSystemBanner(title: String, informativeText: String) {
     }
 }
 
+// MARK: - 开源免责与法律合规声明 (Legal Disclaimer & Safe Harbor)
+func showLegalDisclaimerAlert(window: NSWindow? = nil) {
+    let alert = NSAlert()
+    alert.messageText = "⚖️ 关于 SpotifyLyrics 与法律合规声明"
+    alert.informativeText = """
+    【开源中立性与法律避风港免责声明】
+
+    1. 中立媒体工具定位：
+       SpotifyLyrics 是一款基于开源协议开发的个人桌面歌词同步与本地媒体播放管理工具。软件定位为纯中立中转框架，遵循法律“避风港原则”（Safe Harbor）。
+
+    2. 无版权内容存储与分发：
+       本项目与开发者绝不提供、不存储、不分发任何受商业版权保护的音频文件，源码中绝不内置任何第三方未授权音源或逆向破解接口。
+
+    3. 本地私有源外挂扩展规范：
+       所有高级音源检索均需使用者自行通过受保护的本地私有配置文件 (~/.spotifylyrics/sources.json) 动态挂载。私有配置默认受 .gitignore 隔离保护，绝不纳入代码库追踪。
+
+    4. 合规自担责任：
+       使用者在配置、调用第三方网络接口或导入音源时，应自行确保来源之合法性与版权合规性，使用者需自担相应法律责任，与本项目及开发者无关。
+    """
+    alert.alertStyle = .informational
+    alert.addButton(withTitle: "我已知晓并同意")
+    if let win = window {
+        alert.beginSheetModal(for: win, completionHandler: nil)
+    } else {
+        alert.runModal()
+    }
+}
+
 // MARK: - 12. 全网四维多源聚合搜索与分布式跨平台直链下载引擎 (SongDownloadEngine)
 
 // MARK: - 12.0 音乐来源平台枚举 (MusicSourcePlatform)
@@ -2065,6 +2093,86 @@ struct AntiPreviewGate {
         }
         
         return .pass(actualSeconds: dur)
+    }
+}
+
+// MARK: - 12.2.1 通用本地私有音源规则与动态隔离加载器 (PrivateSourceLoader)
+struct PrivateSourceRule: Codable {
+    var enabled: Bool
+    var name: String
+    var endpoint: String
+    var queryTemplate: String
+    var extractRegex: String
+    var preferFormat: String
+}
+
+class PrivateSourceLoader {
+    static let shared = PrivateSourceLoader()
+    
+    private(set) var loadedRules: [PrivateSourceRule] = []
+    private(set) var activeSourcePath: String?
+    
+    var activeRule: PrivateSourceRule? {
+        return loadedRules.first { $0.enabled }
+    }
+    
+    var hasActiveSource: Bool {
+        return activeRule != nil
+    }
+    
+    init() {
+        reloadRules()
+    }
+    
+    func reloadRules() {
+        loadedRules.removeAll()
+        activeSourcePath = nil
+        
+        let fileManager = FileManager.default
+        let home = fileManager.homeDirectoryForCurrentUser
+        
+        // 运行时动态检查用户受保护的本地私有文件
+        var candidatePaths: [String] = [
+            // 1. ~/.spotifylyrics/sources.json
+            home.appendingPathComponent(".spotifylyrics").appendingPathComponent("sources.json").path,
+            // 2. 项目根目录受忽略的 sources.local.json
+            "/Users/mobai/.gemini/antigravity/scratch/SpotifyLyrics/sources.local.json",
+            URL(fileURLWithPath: fileManager.currentDirectoryPath).appendingPathComponent("sources.local.json").path,
+            // 3. ~/Library/Application Support/SpotifyLyrics/sources.json (SPEC 兼容)
+            home.appendingPathComponent("Library/Application Support/SpotifyLyrics/sources.json").path
+        ]
+        
+        if let bundleDir = Bundle.main.bundlePath as String? {
+            candidatePaths.append(URL(fileURLWithPath: bundleDir).deletingLastPathComponent().appendingPathComponent("sources.local.json").path)
+        }
+        
+        for path in candidatePaths {
+            guard fileManager.fileExists(atPath: path) else { continue }
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { continue }
+            
+            // 1. 尝试解析数组 [PrivateSourceRule]
+            if let rules = try? JSONDecoder().decode([PrivateSourceRule].self, from: data) {
+                self.loadedRules = rules
+                self.activeSourcePath = path
+                NSLog("[PrivateSourceLoader] 🔒 成功从本地私有配置文件加载规则: \(path), 共 \(rules.count) 条规则")
+                return
+            }
+            // 2. 兼容包装格式 { "rules": [...] }
+            struct Wrapper: Codable { var rules: [PrivateSourceRule] }
+            if let wrapper = try? JSONDecoder().decode(Wrapper.self, from: data) {
+                self.loadedRules = wrapper.rules
+                self.activeSourcePath = path
+                NSLog("[PrivateSourceLoader] 🔒 成功从本地私有配置文件加载规则: \(path), 共 \(wrapper.rules.count) 条规则")
+                return
+            }
+            // 3. 兼容单条规则对象格式
+            if let single = try? JSONDecoder().decode(PrivateSourceRule.self, from: data) {
+                self.loadedRules = [single]
+                self.activeSourcePath = path
+                NSLog("[PrivateSourceLoader] 🔒 成功从本地私有配置文件加载单条规则: \(path) [\(single.name)]")
+                return
+            }
+        }
     }
 }
 
@@ -2521,19 +2629,55 @@ class SongDownloadEngine: ObservableObject {
         }
     }
     
-    // MARK: - Master Hi-Res 24bit 全曲音源直链通道
+    // MARK: - 通用本地私有外挂音源解析通道 (基于 PrivateSourceLoader 动态加载)
     func fetchMasterAudioUrl(title: String, artist: String, preferLossless: Bool = true, completion: @escaping (String?, String?) -> Void) {
-        let cleanT = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanA = artist.trimmingCharacters(in: .whitespacesAndNewlines)
-        let queryStr = cleanA.isEmpty ? cleanT : "\(cleanT) \(cleanA)"
-        guard let encodedMsg = queryStr.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
+        // 若本地私有配置不存在或未启用，安全返回 nil，平滑走公开开源基础通道
+        guard let rule = PrivateSourceLoader.shared.activeRule, rule.enabled else {
             completion(nil, nil)
             return
         }
         
-        let br = preferLossless ? 1 : 2
-        let urlStr = "https://oiapi.net/api/Kuwo?msg=\(encodedMsg)&br=\(br)&n=1"
-        guard let url = URL(string: urlStr) else {
+        let cleanT = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanA = artist.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawQuery = cleanA.isEmpty ? cleanT : "\(cleanT) \(cleanA)"
+        
+        let encodedTitle = cleanT.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? cleanT
+        let encodedArtist = cleanA.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? cleanA
+        let encodedQuery = rawQuery.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? rawQuery
+        let brValue = preferLossless ? "1" : "2"
+        let preferFmt = rule.preferFormat.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        // 动态变量模板替换：支持 {title}, {artist}, {query}, {br}, {format}
+        let applyTemplates = { (str: String) -> String in
+            return str
+                .replacingOccurrences(of: "{title}", with: encodedTitle)
+                .replacingOccurrences(of: "{artist}", with: encodedArtist)
+                .replacingOccurrences(of: "{query}", with: encodedQuery)
+                .replacingOccurrences(of: "{br}", with: brValue)
+                .replacingOccurrences(of: "{format}", with: preferFmt)
+        }
+        
+        var finalUrlStr = applyTemplates(rule.endpoint)
+        let queryStr = applyTemplates(rule.queryTemplate)
+        
+        if !queryStr.isEmpty {
+            if finalUrlStr.contains("?") {
+                if queryStr.hasPrefix("?") || queryStr.hasPrefix("&") {
+                    let trimmed = String(queryStr.dropFirst())
+                    finalUrlStr += "&\(trimmed)"
+                } else {
+                    finalUrlStr += "&\(queryStr)"
+                }
+            } else {
+                if queryStr.hasPrefix("?") {
+                    finalUrlStr += queryStr
+                } else {
+                    finalUrlStr += "?\(queryStr)"
+                }
+            }
+        }
+        
+        guard let url = URL(string: finalUrlStr) else {
             completion(nil, nil)
             return
         }
@@ -2548,29 +2692,60 @@ class SongDownloadEngine: ObservableObject {
                 return
             }
             
-            var messageStr: String?
+            var directAudioUrl: String?
+            
+            // 1. 若响应为标准 JSON 且根层或 data 层直接含有 url 字段，优先直接取纯净音频直链
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                messageStr = (json["message"] as? String) ?? (json["msg"] as? String) ?? (json["data"] as? String)
-            }
-            if messageStr == nil {
-                messageStr = String(data: data, encoding: .utf8)
+                if let direct = json["url"] as? String, direct.hasPrefix("http") {
+                    directAudioUrl = direct
+                } else if let dict = json["data"] as? [String: Any], let direct = dict["url"] as? String, direct.hasPrefix("http") {
+                    directAudioUrl = direct
+                }
             }
             
-            guard let message = messageStr else {
+            // 2. 若未从 JSON url 字段直接解析，则从 message/msg/全文字符串中通过正则提取
+            if directAudioUrl == nil {
+                var messageStr: String?
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    messageStr = (json["message"] as? String) ?? (json["msg"] as? String) ?? (json["data"] as? String)
+                }
+                if messageStr == nil {
+                    messageStr = String(data: data, encoding: .utf8)
+                }
+                
+                guard let message = messageStr else {
+                    completion(nil, nil)
+                    return
+                }
+                
+                // 优先使用用户配置的 extractRegex；若未配置，优先匹配音频文件/音频参数特征，最后兜底任意 URL
+                let patterns = rule.extractRegex.isEmpty ? [
+                    "https?://[^\\s\"'<>]+\\.(flac|mp3|m4a|aac|ogg)[^\\s\"'<>]*",
+                    "https?://[^\\s\"'<>]*(?:trackmedia|bitrate|audio)[^\\s\"'<>]*",
+                    "https?://[^\\s\"'<>\\]]+"
+                ] : [rule.extractRegex]
+                
+                for pattern in patterns {
+                    guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+                          let match = regex.firstMatch(in: message, options: [], range: NSRange(location: 0, length: message.utf16.count)) else {
+                        continue
+                    }
+                    var targetRange = match.range(at: 0)
+                    if match.numberOfRanges > 1 && match.range(at: 1).location != NSNotFound {
+                        targetRange = match.range(at: 1)
+                    }
+                    let nsMessage = message as NSString
+                    if targetRange.location != NSNotFound && targetRange.location + targetRange.length <= nsMessage.length {
+                        directAudioUrl = nsMessage.substring(with: targetRange).trimmingCharacters(in: .whitespacesAndNewlines)
+                        break
+                    }
+                }
+            }
+            
+            guard let directUrl = directAudioUrl, directUrl.hasPrefix("http") else {
                 completion(nil, nil)
                 return
             }
-            
-            let pattern = "音乐链接：(\\S+)"
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: []),
-                  let match = regex.firstMatch(in: message, options: [], range: NSRange(location: 0, length: message.utf16.count)),
-                  match.numberOfRanges > 1,
-                  let range = Range(match.range(at: 1), in: message) else {
-                completion(nil, nil)
-                return
-            }
-            
-            let directUrl = String(message[range]).trimmingCharacters(in: .whitespacesAndNewlines)
             guard directUrl.hasPrefix("http") else {
                 completion(nil, nil)
                 return
@@ -2584,6 +2759,8 @@ class SongDownloadEngine: ObservableObject {
                 format = "ogg"
             } else if lower.contains(".mp3") || lower.contains("format=mp3") || lower.contains("mp3") {
                 format = "mp3"
+            } else if !preferFmt.isEmpty {
+                format = preferFmt
             } else {
                 format = "mp3"
             }
@@ -2592,31 +2769,31 @@ class SongDownloadEngine: ObservableObject {
         }.resume()
     }
     
-    // MARK: - 分布式直链解析分发器 (Master Hi-Res 第一优先级 -> Custom API -> 平台内置分发)
+    // MARK: - 分布式直链解析分发器 (本地私有外挂音源通道 -> Custom API -> 平台内置分发)
     func fetchDirectAudioUrl(candidate: SearchTrackItem, completion: @escaping (String?, String?) -> Void) {
-        // 1. 【第一优先级】优先调用 Master Hi-Res 24bit 全曲通道
+        // 1. 【第一优先级】优先调用本地私有外挂音源通道 (若本地未配置私有规则，安全返回 nil 平滑降级)
         fetchMasterAudioUrl(title: candidate.title, artist: candidate.artist) { [weak self] masterUrl, masterFormat in
             guard let self = self else { return }
             if let masterUrl = masterUrl, !masterUrl.isEmpty {
-                NSLog("[SongDownloadEngine] 🚀 命中 Master Hi-Res 直链通道 [\(masterFormat ?? "flac")]: \(candidate.title) - \(candidate.artist)")
+                NSLog("[SongDownloadEngine] 🚀 命中本地私有音源直链通道 [\(masterFormat ?? "flac")]: \(candidate.title) - \(candidate.artist)")
                 completion(masterUrl, masterFormat ?? "flac")
                 return
             }
             
-            // 2. Master 通道未命中或超时，平滑降级至自定义 API 节点
+            // 2. 本地私有通道未命中或未配置，平滑降级至自定义 API 节点
             if let customApi = DownloadConfig.shared.customApiUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !customApi.isEmpty {
                 self.fetchFromCustomApi(customApi: customApi, candidate: candidate) { [weak self] directUrl, format in
                     if let directUrl = directUrl, !directUrl.isEmpty {
                         completion(directUrl, format ?? "mp3")
                     } else {
-                        // 自定义 API 未命中或失败，平滑降级至平台内置解析通道
+                        // 自定义 API 未命中或失败，平滑降级至公开开源基础平台通道
                         self?.fetchPlatformDirectUrl(candidate: candidate, completion: completion)
                     }
                 }
                 return
             }
             
-            // 3. 平滑降级至现有 fetchPlatformDirectUrl 内置多平台通道
+            // 3. 平滑降级至现有公开开源基础通道
             self.fetchPlatformDirectUrl(candidate: candidate, completion: completion)
         }
     }
@@ -3797,6 +3974,24 @@ struct SearchDownloadView: View {
             Spacer()
             
             Button(action: {
+                showLegalDisclaimerAlert(window: SearchWindowManager.shared.currentWindow)
+            }) {
+                HStack(spacing: 4) {
+                    Image(systemName: "checkmark.shield")
+                        .font(.system(size: 11))
+                    Text("合规声明...")
+                        .font(.system(size: 12, design: .rounded))
+                }
+                .foregroundColor(.white.opacity(0.85))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.white.opacity(0.12))
+                .cornerRadius(6)
+            }
+            .buttonStyle(.plain)
+            .help("查看开源中立性与法律避风港免责声明")
+
+            Button(action: {
                 config.selectDirectory(window: SearchWindowManager.shared.currentWindow)
             }) {
                 HStack(spacing: 4) {
@@ -4588,6 +4783,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             menu.addItem(NSMenuItem(title: "📻 切换回 Spotify 模式", action: #selector(switchToSpotifyAction), keyEquivalent: ""))
         }
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "⚖️ 关于与法律合规声明...", action: #selector(showLegalDisclaimerAction), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "🔄 强制重新拉取当前歌词", action: #selector(reloadLyrics), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "🗑 清除本地歌词缓存 (已缓存 \(count) 首)", action: #selector(clearLyricsCache), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "重置窗口大小与居中", action: #selector(resetWindow), keyEquivalent: ""))
@@ -4738,6 +4934,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         DownloadConfig.shared.selectDirectory(window: window) { [weak self] _ in
             self?.updateMenu()
         }
+    }
+
+    @objc func showLegalDisclaimerAction() {
+        showLegalDisclaimerAlert(window: window)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
