@@ -2521,23 +2521,104 @@ class SongDownloadEngine: ObservableObject {
         }
     }
     
-    // MARK: - 分布式直链解析分发器 (Custom API 优先 -> 跨平台分发)
-    func fetchDirectAudioUrl(candidate: SearchTrackItem, completion: @escaping (String?, String?) -> Void) {
-        // 1. 用户自定义 API 节点优先判定
-        if let customApi = DownloadConfig.shared.customApiUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !customApi.isEmpty {
-            fetchFromCustomApi(customApi: customApi, candidate: candidate) { [weak self] directUrl, format in
-                if let directUrl = directUrl, !directUrl.isEmpty {
-                    completion(directUrl, format ?? "mp3")
-                } else {
-                    // 自定义 API 未命中或失败，平滑降级至平台内置解析通道
-                    self?.fetchPlatformDirectUrl(candidate: candidate, completion: completion)
-                }
-            }
+    // MARK: - Master Hi-Res 24bit 全曲音源直链通道
+    func fetchMasterAudioUrl(title: String, artist: String, preferLossless: Bool = true, completion: @escaping (String?, String?) -> Void) {
+        let cleanT = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanA = artist.trimmingCharacters(in: .whitespacesAndNewlines)
+        let queryStr = cleanA.isEmpty ? cleanT : "\(cleanT) \(cleanA)"
+        guard let encodedMsg = queryStr.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
+            completion(nil, nil)
             return
         }
         
-        // 2. 走平台内置直链解析通道
-        fetchPlatformDirectUrl(candidate: candidate, completion: completion)
+        let br = preferLossless ? 1 : 2
+        let urlStr = "https://oiapi.net/api/Kuwo?msg=\(encodedMsg)&br=\(br)&n=1"
+        guard let url = URL(string: urlStr) else {
+            completion(nil, nil)
+            return
+        }
+        
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 4.5
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
+        
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            guard let data = data else {
+                completion(nil, nil)
+                return
+            }
+            
+            var messageStr: String?
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                messageStr = (json["message"] as? String) ?? (json["msg"] as? String) ?? (json["data"] as? String)
+            }
+            if messageStr == nil {
+                messageStr = String(data: data, encoding: .utf8)
+            }
+            
+            guard let message = messageStr else {
+                completion(nil, nil)
+                return
+            }
+            
+            let pattern = "音乐链接：(\\S+)"
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: []),
+                  let match = regex.firstMatch(in: message, options: [], range: NSRange(location: 0, length: message.utf16.count)),
+                  match.numberOfRanges > 1,
+                  let range = Range(match.range(at: 1), in: message) else {
+                completion(nil, nil)
+                return
+            }
+            
+            let directUrl = String(message[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard directUrl.hasPrefix("http") else {
+                completion(nil, nil)
+                return
+            }
+            
+            let lower = directUrl.lowercased()
+            let format: String
+            if lower.contains(".flac") || lower.contains("format=flac") || lower.contains("flac") {
+                format = "flac"
+            } else if lower.contains(".ogg") || lower.contains("format=ogg") || lower.contains("ogg") {
+                format = "ogg"
+            } else if lower.contains(".mp3") || lower.contains("format=mp3") || lower.contains("mp3") {
+                format = "mp3"
+            } else {
+                format = "mp3"
+            }
+            
+            completion(directUrl, format)
+        }.resume()
+    }
+    
+    // MARK: - 分布式直链解析分发器 (Master Hi-Res 第一优先级 -> Custom API -> 平台内置分发)
+    func fetchDirectAudioUrl(candidate: SearchTrackItem, completion: @escaping (String?, String?) -> Void) {
+        // 1. 【第一优先级】优先调用 Master Hi-Res 24bit 全曲通道
+        fetchMasterAudioUrl(title: candidate.title, artist: candidate.artist) { [weak self] masterUrl, masterFormat in
+            guard let self = self else { return }
+            if let masterUrl = masterUrl, !masterUrl.isEmpty {
+                NSLog("[SongDownloadEngine] 🚀 命中 Master Hi-Res 直链通道 [\(masterFormat ?? "flac")]: \(candidate.title) - \(candidate.artist)")
+                completion(masterUrl, masterFormat ?? "flac")
+                return
+            }
+            
+            // 2. Master 通道未命中或超时，平滑降级至自定义 API 节点
+            if let customApi = DownloadConfig.shared.customApiUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !customApi.isEmpty {
+                self.fetchFromCustomApi(customApi: customApi, candidate: candidate) { [weak self] directUrl, format in
+                    if let directUrl = directUrl, !directUrl.isEmpty {
+                        completion(directUrl, format ?? "mp3")
+                    } else {
+                        // 自定义 API 未命中或失败，平滑降级至平台内置解析通道
+                        self?.fetchPlatformDirectUrl(candidate: candidate, completion: completion)
+                    }
+                }
+                return
+            }
+            
+            // 3. 平滑降级至现有 fetchPlatformDirectUrl 内置多平台通道
+            self.fetchPlatformDirectUrl(candidate: candidate, completion: completion)
+        }
     }
     
     private func fetchPlatformDirectUrl(candidate: SearchTrackItem, completion: @escaping (String?, String?) -> Void) {
@@ -2822,44 +2903,89 @@ class SongDownloadEngine: ObservableObject {
             }
             
             let workingTempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".tmp")
+            var effectiveTempURL = workingTempURL
+            var effectiveFormat = formatType
             var req = URLRequest(url: audioDownloadUrl)
             req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
             req.timeoutInterval = 45.0
             
             let downloadTask = URLSession.shared.downloadTask(with: req) { tempURL, response, error in
                 guard let tempURL = tempURL, error == nil else {
-                    try? FileManager.default.removeItem(at: workingTempURL)
+                    try? FileManager.default.removeItem(at: effectiveTempURL)
                     completion(false, error?.localizedDescription ?? "下载失败")
                     return
                 }
                 
                 do {
-                    if FileManager.default.fileExists(atPath: workingTempURL.path) {
-                        try FileManager.default.removeItem(at: workingTempURL)
+                    if FileManager.default.fileExists(atPath: effectiveTempURL.path) {
+                        try FileManager.default.removeItem(at: effectiveTempURL)
                     }
-                    try FileManager.default.moveItem(at: tempURL, to: workingTempURL)
+                    try FileManager.default.moveItem(at: tempURL, to: effectiveTempURL)
                 } catch {
-                    try? FileManager.default.removeItem(at: workingTempURL)
+                    try? FileManager.default.removeItem(at: effectiveTempURL)
                     completion(false, "临时文件移动失败")
                     return
                 }
                 
                 // 1. 校验大小 > 100KB
-                let fileSize = (try? FileManager.default.attributesOfItem(atPath: workingTempURL.path)[.size] as? Int64) ?? 0
+                let fileSize = (try? FileManager.default.attributesOfItem(atPath: effectiveTempURL.path)[.size] as? Int64) ?? 0
                 guard fileSize > 100 * 1024 else {
-                    try? FileManager.default.removeItem(at: workingTempURL)
+                    try? FileManager.default.removeItem(at: effectiveTempURL)
                     completion(false, "音频文件过小 (<100KB)，判定为无效内容")
                     return
                 }
                 
-                // 2. 物理时长门禁检查
+                // 2. 格式自适应与 OGG 转码处理 (FFmpeg Pipeline)
+                var isOgg = (effectiveFormat?.lowercased() == "ogg")
+                if !isOgg, let handle = try? FileHandle(forReadingFrom: effectiveTempURL) {
+                    let header = handle.readData(ofLength: 4)
+                    try? handle.close()
+                    if header.count >= 4 && header.starts(with: [0x4F, 0x67, 0x67, 0x53]) { // "OggS"
+                        isOgg = true
+                    }
+                }
+                
+                if isOgg {
+                    let ffmpegCandidates = [
+                        "/opt/homebrew/bin/ffmpeg",
+                        "/usr/local/bin/ffmpeg",
+                        "/usr/bin/ffmpeg"
+                    ]
+                    if let ffmpegPath = ffmpegCandidates.first(where: { FileManager.default.fileExists(atPath: $0) }) {
+                        let convertedTempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp3")
+                        let process = Process()
+                        process.executableURL = URL(fileURLWithPath: ffmpegPath)
+                        process.arguments = ["-y", "-i", effectiveTempURL.path, "-c:a", "libmp3lame", "-q:a", "0", convertedTempURL.path]
+                        process.standardOutput = Pipe()
+                        process.standardError = Pipe()
+                        
+                        do {
+                            try process.run()
+                            process.waitUntilExit()
+                            if process.terminationStatus == 0 && FileManager.default.fileExists(atPath: convertedTempURL.path) {
+                                try? FileManager.default.removeItem(at: effectiveTempURL)
+                                effectiveTempURL = convertedTempURL
+                                effectiveFormat = "mp3"
+                                NSLog("[SongDownloadEngine] 🔄 OGG -> MP3 转码成功: \(effectiveTempURL.path)")
+                            } else {
+                                try? FileManager.default.removeItem(at: convertedTempURL)
+                                NSLog("[SongDownloadEngine] ⚠️ ffmpeg 转码未正常退出 (code: \(process.terminationStatus))")
+                            }
+                        } catch {
+                            try? FileManager.default.removeItem(at: convertedTempURL)
+                            NSLog("[SongDownloadEngine] ⚠️ ffmpeg 执行异常: \(error)")
+                        }
+                    }
+                }
+                
+                // 3. 物理时长门禁检查
                 let effTargetDur = targetDuration > 0 ? targetDuration : candidate.durationSeconds
-                let gateResult = AntiPreviewGate.inspectAudio(at: workingTempURL, targetDuration: effTargetDur)
+                let gateResult = AntiPreviewGate.inspectAudio(at: effectiveTempURL, targetDuration: effTargetDur)
                 
                 switch gateResult {
                 case .fail(let reason, let actualSec):
                     // 门禁拦截！立即删除临时文件
-                    try? FileManager.default.removeItem(at: workingTempURL)
+                    try? FileManager.default.removeItem(at: effectiveTempURL)
                     NSLog("[AntiPreviewGate] 拦截候选 id=\(candidate.id) [\(candidate.source.rawValue)] (\(candidate.title) - \(candidate.artist)): \(reason)")
                     completion(false, "防试听门禁拦截: \(reason) (\(String(format: "%.1f", actualSec))s)")
                     
@@ -2867,7 +2993,7 @@ class SongDownloadEngine: ObservableObject {
                     // 门禁通过！判定为真实完整音频！
                     DownloadConfig.shared.ensureDirectoryExists()
                     let destDir = DownloadConfig.shared.downloadDirectoryURL
-                    let ext = self.detectAudioExtension(fileURL: workingTempURL, response: response, fallbackFormat: formatType)
+                    let ext = self.detectAudioExtension(fileURL: effectiveTempURL, response: response, fallbackFormat: effectiveFormat)
                     let finalTitle = targetTitle.isEmpty ? candidate.title : targetTitle
                     let finalArtist = targetArtist.isEmpty ? candidate.artist : targetArtist
                     let safeTitle = DownloadConfig.cleanFileName(finalTitle)
@@ -2880,9 +3006,9 @@ class SongDownloadEngine: ObservableObject {
                         if FileManager.default.fileExists(atPath: audioDestURL.path) {
                             try FileManager.default.removeItem(at: audioDestURL)
                         }
-                        try FileManager.default.moveItem(at: workingTempURL, to: audioDestURL)
+                        try FileManager.default.moveItem(at: effectiveTempURL, to: audioDestURL)
                     } catch {
-                        try? FileManager.default.removeItem(at: workingTempURL)
+                        try? FileManager.default.removeItem(at: effectiveTempURL)
                         completion(false, "目标文件写入失败: \(error.localizedDescription)")
                         return
                     }
@@ -3005,19 +3131,26 @@ class SongDownloadEngine: ObservableObject {
         }
     }
     
-    // 通过文件头魔数或 HTTP 响应判定音频扩展名 (.mp3 或 .flac)
+    // 通过文件头魔数或 HTTP 响应判定音频扩展名 (.mp3 / .flac / .ogg)
     private func detectAudioExtension(fileURL: URL, response: URLResponse?, fallbackFormat: String?) -> String {
         if let fileHandle = try? FileHandle(forReadingFrom: fileURL) {
             defer { try? fileHandle.close() }
             let headerData = fileHandle.readData(ofLength: 4)
-            if headerData.count >= 4 && headerData.starts(with: [0x66, 0x4C, 0x61, 0x43]) {
-                return "flac"
+            if headerData.count >= 4 {
+                if headerData.starts(with: [0x66, 0x4C, 0x61, 0x43]) { // "fLaC"
+                    return "flac"
+                }
+                if headerData.starts(with: [0x4F, 0x67, 0x67, 0x53]) { // "OggS"
+                    return "ogg"
+                }
             }
         }
         
         if let mime = response?.mimeType?.lowercased() {
             if mime.contains("flac") {
                 return "flac"
+            } else if mime.contains("ogg") {
+                return "ogg"
             } else if mime.contains("mpeg") || mime.contains("mp3") {
                 return "mp3"
             }
@@ -3025,11 +3158,14 @@ class SongDownloadEngine: ObservableObject {
         
         if let respUrl = response?.url?.pathExtension.lowercased(), !respUrl.isEmpty {
             if respUrl == "flac" { return "flac" }
+            if respUrl == "ogg" { return "ogg" }
             if respUrl == "mp3" { return "mp3" }
         }
         
-        if let fallback = fallbackFormat?.lowercased(), fallback == "flac" {
-            return "flac"
+        if let fallback = fallbackFormat?.lowercased() {
+            if fallback == "flac" { return "flac" }
+            if fallback == "ogg" { return "ogg" }
+            if fallback == "mp3" { return "mp3" }
         }
         
         return "mp3"
