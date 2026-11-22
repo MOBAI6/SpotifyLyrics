@@ -1,6 +1,6 @@
-# SpotifyLyrics 音频防试听门禁与精准歌手匹配规范 (SPEC)
+# SpotifyLyrics 全网四维多源聚合搜索与分布式跨平台直链下载规范 (SPEC)
 
-本文档针对**“下载仅十几秒试听片段”**与**“歌名对上但歌手不符”**的痛点，制定**音频真实时长物理门禁**、**歌手+歌名+时长三维置信度评分匹配**与**候选换源自动重试**的完整技术规范。
+针对用户反馈**“下载歌曲来源太少，好多都下载不了，甚至搜索不到”**的痛点，全面推行**全网四大主流平台并发聚合搜索**、**多源分布式直链解析**、**跨平台智能自动换源（Cross-Platform Fallback）**与**防试听物理时长门禁**技术方案。
 
 ---
 
@@ -9,36 +9,52 @@
 ```mermaid
 flowchart TD
     subgraph User["👤 用户交互 (User)"]
-        A1["触发下载当前歌曲 (⌘S) 或搜索曲目下载"]
-        A2["收到系统完成通知并在音乐目录查收完整正曲与LRC"]
-        A3["若仅有试听片段且换源均失败，收到诚实明确的失败提示"]
+        U1["输入关键词搜索 (⌘F) 或一键下载当前播放 (⌘S)"]
+        U2["搜索窗口实时呈现聚合结果，带 [网易][酷狗][酷我][QQ] 来源徽标"]
+        U3["支持切换顶部平台 Tab：全部 / 网易云 / 酷狗 / 酷我 / QQ音乐"]
+        U4["收到下载完成通知，在本地曲库 (⌘L) 离线播放并展示同步歌词"]
+        U5["若全网所有源均受限，获得明确、客观的失败提示与原因"]
     end
 
-    subgraph CandidateRanker["🎯 候选集三维精准评分器 (Candidate Ranker)"]
-        B1["获取目标曲目 (Title, Artist, TargetDuration)"]
-        B2["全网搜索多条候选曲目 (15~20首)"]
-        B3["歌手强匹配校验：清洗歌手名，非目标歌手一票否决剔除"]
-        B4["过滤翻唱/伴奏/变奏噪音 (Cover / DJ / 伴奏 惩罚扣分)"]
-        B5["时长容差评分 (|候选时长 - 目标时长| <= 5s 加分)"]
-        B6["输出高置信度候选队列 (按总分从高到低排序)"]
+    subgraph MultiSearch["🌐 四维多源并发检索引擎 (MultiSourceSearchEngine)"]
+        S1["接收关键词 (歌名/歌手) 并发派发"]
+        S2["源 1: 网易云 (Netease API)"]
+        S3["源 2: 酷狗音乐 (Kugou Mobile API)"]
+        S4["源 3: 酷我音乐 (Kuwo Search API)"]
+        S5["源 4: QQ音乐 (Tencent Smartbox/Search API)"]
+        S6["多源结果汇聚、来源标注、去重与三维置信度综合排序"]
     end
 
-    subgraph DownloadPipeline["⚙️ 换源下载与防试听门禁 (Anti-Preview Gate)"]
-        C1["依次取出得分最高的候选歌曲"]
-        C2["三通道解析音频直链并异步流式下载至临时文件"]
-        C3{"【物理时长门禁】\nAVURLAsset 读取真实音频时长\n1. 真实时长 >= 60s?\n2. 与目标时长比对误差 <= 15s?"}
-        C4["判定为 VIP 试听残卷 (十几秒/30s)\n立即清理临时文件"]
-        C5{"队列中是否还有其他高分候选?"}
-        C6["判定为完整正曲！\n魔数格式校验与落盘 (~/Downloads/Music)"]
-        C7["同步拉取/写入同名 .lrc 歌词并完成归档"]
+    subgraph DownloadPipeline["⚙️ 分布式直链解析与跨平台换源 (MultiSourceDownloadEngine)"]
+        D1["优先取出用户点击项或最高分候选曲目"]
+        D2{"根据来源分发直链解析通道"}
+        D3["网易云通道: Meting 302 / Paugram / 官方 CDN 直链"]
+        D4["酷我通道: Antiserver 直链转换 (MP3/FLAC)"]
+        D5["酷狗通道: 移动端音频流解析 / 多 CDN 回退"]
+        D6["自定义 API 节点: 用户自建解析服务 (若已配置)"]
+        D7{"【物理时长门禁 AntiPreviewGate】\nAVURLAsset 探测真实音频时长\n时长 >= 60s 且误差在允许范围?"}
+        D8["拦截 VIP 试听残卷 (十几秒)！立即物理删除临时文件"]
+        D9{"【跨平台自动换源】\n自动跨源检索其他平台的完整原唱版本"}
+        D10["门禁放行！完整音频原子落盘 (~/Downloads/Music)"]
+        D11["并发拉取标准 LRC 并写入同名文件，通知曲库"]
     end
 
-    A1 --> B1 --> B2 --> B3 --> B4 --> B5 --> B6
-    B6 --> C1 --> C2 --> C3
-    C3 -- "不满足 (仅十几秒试听)" --> C4 --> C5
-    C5 -- "有其他候选" --> C1
-    C5 -- "无其他候选" --> A3
-    C3 -- "满足 (完整正曲)" --> C6 --> C7 --> A2
+    U1 --> S1
+    S1 --> S2 & S3 & S4 & S5
+    S2 & S3 & S4 & S5 --> S6
+    S6 --> U2 & U3
+    U1 -.->|⌘S 直接下载| D1
+    U2 -->|点击下载| D1
+    D1 --> D2
+    D2 -->|Netease| D3
+    D2 -->|Kuwo| D4
+    D2 -->|Kugou| D5
+    D2 -->|Custom| D6
+    D3 & D4 & D5 & D6 --> D7
+    D7 -- "试听残卷 (拦截)" --> D8 --> D9
+    D9 -- "找到跨平台候选" --> D1
+    D9 -- "全网穷尽无完整源" --> U5
+    D7 -- "完整正曲 (通过)" --> D10 --> D11 --> U4
 ```
 
 ---
@@ -49,47 +65,50 @@ flowchart TD
 sequenceDiagram
     autonumber
     actor User as 👤 用户
-    participant VM as 🧠 LyricViewModel
-    participant Engine as ⚙️ SongDownloadEngine
-    participant Scorer as 🎯 MultiFactorScorer
-    participant RemoteAPI as 🌐 音乐接口 (Meting/Paugram)
-    participant AudioInspector as 🔍 AVURLAsset 时长探测器
-    participant FS as 💾 本地文件系统 (Music Dir)
+    participant View as 🖥️ SearchDownloadView
+    participant SearchMgr as 🌐 MultiSourceSearchEngine
+    participant Netease as 🔴 网易云源
+    participant Kugou as 🔵 酷狗音乐源
+    participant Kuwo as 🟡 酷我音乐源
+    participant Downloader as ⚙️ MultiSourceDownloadEngine
+    participant Gate as 🛡️ AntiPreviewGate (AVURLAsset)
+    participant FS as 💾 本地存储 (Music Dir)
 
-    User->>VM: 触发下载 (⌘S / 搜索下载)
-    VM->>Engine: downloadTrack(title, artist, targetDuration)
-    Engine->>RemoteAPI: 检索前 20 条候选列表
-    RemoteAPI-->>Engine: 返回候选集
-
-    rect rgb(245, 248, 255)
-    Note over Engine, Scorer: 阶段一：歌手+歌名+时长三维评分
-    Engine->>Scorer: rankCandidates(targetTitle, targetArtist, targetDuration)
-    Scorer->>Scorer: 1. 歌手包含度检测 (非目标歌手直接剔除)
-    Scorer->>Scorer: 2. 负面词降权 (Cover, 翻唱, DJ, 伴奏)
-    Scorer->>Scorer: 3. 时长逼近加分 (|Δt| <= 5s)
-    Scorer-->>Engine: 返回有序高分队列 candidatesQueue [C1, C2, C3...]
+    User->>View: 唤出搜索面板并输入 "晴天 周杰伦" (⌘F)
+    View->>SearchMgr: searchMultiPlatform(keyword)
+    
+    par 并发向三大主流开放平台派发搜索请求
+        SearchMgr->>Netease: GET music.163.com/api/cloudsearch/pc
+        SearchMgr->>Kugou: GET mobilecdn.kugou.com/api/v3/search/song
+        SearchMgr->>Kuwo: GET search.kuwo.cn/r.s?client=kt
+    and
+        Netease-->>SearchMgr: 返回候选集 (可能受版权保护)
+        Kugou-->>SearchMgr: 返回原版曲目 (周杰伦原唱、时长 269s)
+        Kuwo-->>SearchMgr: 返回原版曲目 (FLAC/320K、时长 269s)
     end
 
-    rect rgb(255, 250, 240)
-    Note over Engine, AudioInspector: 阶段二：带防试听门禁的换源下载循环
-    loop 遍历高分候选 (直至命中完整版)
-        Engine->>RemoteAPI: 请求候选 Ci 音频直链
-        RemoteAPI-->>Engine: 返回音频流
-        Engine->>FS: 下载到临时文件 tempURL
-        Engine->>AudioInspector: AVURLAsset(url: tempURL).duration
-        AudioInspector-->>Engine: 真实时长 actualSeconds
+    SearchMgr->>SearchMgr: 结果打标 ([网易] [酷狗] [酷我])，多维评分排序
+    SearchMgr-->>View: 渲染全网聚合列表，支持按平台 Tab 过滤
 
-        alt actualSeconds < 60s 或 |actualSeconds - targetDuration| > 20s
-            Note over Engine: 触发防试听门禁：拦截 15s/30s 试听残卷！
-            Engine->>FS: 物理删除 tempURL (即测即删)
-            Note over Engine: 继续尝试下一首候选 C(i+1)
-        else 真实时长合格 (>= 60s 且匹配正曲)
-            Note over Engine: 门禁放行！真实完整音频确认
-            Engine->>FS: 原子移动至目标目录: <安全歌名 - 安全歌手>.<ext>
-            Engine->>FS: 并发拉取并写入同名 <安全歌名 - 安全歌手>.lrc
-            Engine-->>VM: 回调成功，高亮 Finder 并触发系统通知
+    User->>View: 点击下载某首歌曲 (或当前播放 ⌘S)
+    View->>Downloader: downloadTrack(item)
+
+    loop 尝试当前源及跨平台 Fallback 源
+        Downloader->>Downloader: 调用对应平台直链解析器
+        Downloader->>FS: 下载流至 .downloading 临时文件
+        Downloader->>Gate: inspectAudio(tempURL)
+        
+        alt 时长 < 60s (试听残卷)
+            Gate-->>Downloader: 门禁拦截 (15.0s < 60s)
+            Downloader->>FS: 物理删除临时文件 (即测即删)
+            Downloader->>Downloader: 跨平台自动提取下一个候选源重试
+        else 时长合格 (>= 60s 完整音频)
+            Gate-->>Downloader: 门禁通过 (269.0s)
+            Downloader->>FS: 原子移动至 <歌名 - 歌手>.<ext>
+            Downloader->>FS: 同步写入同名 <歌名 - 歌手>.lrc
+            Downloader-->>View: 下载状态更新为完成
+            Downloader-->>User: 系统通知与 Finder 高亮
         end
-    end
     end
 ```
 
@@ -97,28 +116,41 @@ sequenceDiagram
 
 ## 三、 详细规格与算法阈值
 
-### 1. 歌手与候选集评分公式 (Multi-Factor Scoring)
-- **歌手纯净相似度 (Artist Score, 满分 50 分)**：
-  - 清洗规则：去除 `(`、`)`、`feat.`、`ft.`、`with` 后缀，转小写与简体；
-  - 匹配判定：若目标歌手完全出现在候选歌手字段中，得分 `50`；
-  - **白名单一票否决制**：若候选歌手列表与目标歌手没有任何交集（例如目标为“周杰伦”，候选为“翻唱小周”），得分为 `-999`，**直接从候选队列中丢弃**。
-- **歌名纯净度与负面标签过滤 (Title Score, 满分 30 分)**：
-  - 目标歌名与候选歌名完全一致：`30` 分；
-  - 负面词过滤：若目标曲名本身不含“翻唱/伴奏/cover/dj”，而候选词包含以下词汇：
-    - `["翻唱", "cover", "伴奏", "inst", "instrumental", "dj版", "钢琴版", "吉他版", "remix", "纯音乐"]`
-    - 每命中一个强扣 `30` 分，确保原唱正版排在最前。
-- **时长逼近评分 (Duration Score, 满分 20 分)**：
-  - 时长差 $|D_{cand} - D_{target}| \le 3$ 秒：`20` 分；
-  - 时长差 $\le 8$ 秒：`10` 分；
-  - 时长差 $> 30$ 秒：`-30` 分。
-- **入选门槛**：仅总分 $\ge 60$ 分的曲目才允许进入下载尝试队列。
+### 1. 平台枚举与元数据模型
+```swift
+enum MusicSourcePlatform: String, CaseIterable, Identifiable {
+    case all = "全部"
+    case netease = "网易云"
+    case kugou = "酷狗"
+    case kuwo = "酷我"
+    case qq = "QQ音乐"
+    
+    var id: String { rawValue }
+    var badgeColor: Color { ... }
+}
 
-### 2. 真实音频物理时长门禁 (Anti-Preview Gate)
-- **判定时机**：文件下载完成后、重命名归档前；
-- **判定方法**：使用 `AVURLAsset(url: tempURL)` 读取实际音轨物理时长；
-- **判定规则**：
-  1. **绝对下限**：`actualDuration >= 60.0` 秒（任何只有十几秒、30秒的残片一律拦截）；
-  2. **相对容差**：若目标歌曲时长已知（$T_{target} > 30$ 秒）：
-     - 要求 $|actualDuration - T_{target}| \le 18.0$ 秒（或时长比率在 $85\% \sim 115\%$ 之间）；
-  3. **拦截动作**：若判定为试听残卷，立即执行 `FileManager.default.removeItem(at: tempURL)`，并自动进入下一首候选换源重试；
-  4. **全试听兜底**：若所有公开源版本均只有试听残卷，向用户明确反馈错误，严禁以残卷充当完成。
+struct SearchTrackItem: Identifiable, Equatable {
+    let id: String           // 唯一标识 (例如 "netease_12345", "kugou_hash", "kuwo_rid")
+    let numericId: Int       // 兼容纯数字 id
+    let source: MusicSourcePlatform
+    let title: String
+    let artist: String
+    let album: String
+    let durationSeconds: Double
+    let qualityTag: String    // "FLAC", "320K", "192K", "128K"
+    let extraData: [String: String] // 存放 hash, album_id, rid 等解析参数
+}
+```
+
+### 2. 多源并发搜索机制
+- 使用 `DispatchGroup` 并发调度四大平台的搜索请求；
+- 单个平台超时设置：`4.0s`，避免单源网络延迟拖慢整体响应；
+- 各源结果合并时，优先展示通过歌手匹配与歌名精准度的高分项，打上对应平台彩色徽标；
+- 在搜索界面顶部提供 `Picker("平台", selection: $selectedPlatform)`，可随时切换【全部】、【网易云】、【酷狗】、【酷我】。
+
+### 3. 多平台直链解析与跨平台自动换源
+- **网易云**：Meting 302 Location 捕获 ➔ Paugram 备用 ➔ 官方 CDN；
+- **酷我**：`antiserver.kuwo.cn/anti.s?type=convert_url&rid={rid}&format=mp3&response=url`；
+- **酷狗**：移动端直链 API 及 CDN 回退解析；
+- **自定义 API**：支持在 `DownloadConfig` 中配置外部/自建解析 API 地址，享有最高解析优先级；
+- **AntiPreviewGate 门禁保护**：所有下载的音频必须通过 `AVURLAsset` 物理时长校验（$\ge 60$ 秒且误差受控），试听残卷一律物理销毁并不中断流水线，自动无感触发跨平台换源轮询。

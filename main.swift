@@ -1673,10 +1673,17 @@ class DownloadConfig: ObservableObject {
     static let shared = DownloadConfig()
     
     private let userDefaultsKey = "UserDownloadDirectory"
+    private let customApiUrlKey = "UserCustomApiUrl"
     
     @Published var downloadDirectoryURL: URL {
         didSet {
             UserDefaults.standard.set(downloadDirectoryURL.path, forKey: userDefaultsKey)
+        }
+    }
+    
+    @Published var customApiUrl: String? {
+        didSet {
+            UserDefaults.standard.set(customApiUrl, forKey: customApiUrlKey)
         }
     }
     
@@ -1701,6 +1708,7 @@ class DownloadConfig: ObservableObject {
                 .appendingPathComponent("Music")
             self.downloadDirectoryURL = defaultDir
         }
+        self.customApiUrl = UserDefaults.standard.string(forKey: customApiUrlKey)
         ensureDirectoryExists()
     }
     
@@ -1774,14 +1782,55 @@ func showSystemBanner(title: String, informativeText: String) {
     }
 }
 
-// MARK: - 12. 双轨检索与下载引擎 (SongDownloadEngine)
+// MARK: - 12. 全网四维多源聚合搜索与分布式跨平台直链下载引擎 (SongDownloadEngine)
+
+// MARK: - 12.0 音乐来源平台枚举 (MusicSourcePlatform)
+enum MusicSourcePlatform: String, CaseIterable, Identifiable {
+    case all = "全部"
+    case netease = "网易云"
+    case kugou = "酷狗"
+    case kuwo = "酷我"
+    case qq = "QQ音乐"
+    
+    var id: String { rawValue }
+    
+    var badgeShortTitle: String {
+        switch self {
+        case .all: return "全部"
+        case .netease: return "网易"
+        case .kugou: return "酷狗"
+        case .kuwo: return "酷我"
+        case .qq: return "QQ"
+        }
+    }
+    
+    var badgeColor: Color {
+        switch self {
+        case .all:
+            return Color.gray
+        case .netease:
+            return Color(red: 0.90, green: 0.22, blue: 0.21) // 红色
+        case .kugou:
+            return Color(red: 0.12, green: 0.53, blue: 0.90) // 蓝色
+        case .kuwo:
+            return Color(red: 0.95, green: 0.60, blue: 0.15) // 橙色
+        case .qq:
+            return Color(red: 0.18, green: 0.80, blue: 0.44) // 绿色
+        }
+    }
+}
+
+// MARK: - 12.0 多源聚合曲目数据模型 (SearchTrackItem)
 struct SearchTrackItem: Identifiable, Equatable {
-    let id: Int
+    let id: String // 跨平台唯一标识 (例如 netease_123, kugou_hash, kuwo_rid, qq_mid)
+    let numericId: Int
+    let source: MusicSourcePlatform
     let title: String
     let artist: String
     let album: String
     let durationSeconds: Double
-    let qualityTag: String // "FLAC" / "320K" / "HQ"
+    let qualityTag: String // "FLAC" / "320K" / "192K" / "128K"
+    let extraData: [String: String] // 存放 hash, album_id, rid, songmid 等解析参数
     
     var formattedDuration: String {
         let m = Int(durationSeconds) / 60
@@ -1950,7 +1999,14 @@ struct MultiFactorScorer {
         let tScore = computeTitleScore(candTitle: candidate.title, candArtist: candidate.artist, candAlbum: candidate.album, targetTitle: targetTitle, targetArtist: targetArtist)
         let dScore = computeDurationScore(candDuration: candidate.durationSeconds, targetDuration: targetDuration)
         
-        return aScore + tScore + dScore
+        var qBonus = 0.0
+        if candidate.qualityTag == "FLAC" {
+            qBonus = 5.0
+        } else if candidate.qualityTag == "320K" {
+            qBonus = 2.0
+        }
+        
+        return aScore + tScore + dScore + qBonus
     }
     
     // 候选曲目过滤并按高置信度从高到低排序
@@ -2019,31 +2075,161 @@ enum TrackDownloadStatus: Equatable {
     case failed(error: String)
 }
 
+// MARK: - 12.3 全网四维多源下载引擎实现
 class SongDownloadEngine: ObservableObject {
     static let shared = SongDownloadEngine()
     
-    @Published var activeDownloads: [Int: TrackDownloadStatus] = [:]
+    // 键统一升级为 String，杜绝跨平台 id 类型冲突
+    @Published var activeDownloads: [String: TrackDownloadStatus] = [:]
     
-    // 搜索候选曲目列表 (歌名、歌手、专辑、时长、高品质音质标签 320K/FLAC)
+    // MARK: - 四维多源并发聚合搜索 (网易云 + 酷狗 + 酷我 + QQ音乐)
     func searchTracks(query: String, completion: @escaping ([SearchTrackItem]) -> Void) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
-              let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let url = URL(string: "https://music.163.com/api/cloudsearch/pc?s=\(encoded)&type=1&limit=20") else {
+        guard !trimmed.isEmpty else {
+            completion([])
+            return
+        }
+        
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var allResults: [SearchTrackItem] = []
+        
+        // 1. 网易云
+        group.enter()
+        searchNetease(query: trimmed) { items in
+            lock.lock()
+            allResults.append(contentsOf: items)
+            lock.unlock()
+            group.leave()
+        }
+        
+        // 2. 酷狗
+        group.enter()
+        searchKugou(query: trimmed) { items in
+            lock.lock()
+            allResults.append(contentsOf: items)
+            lock.unlock()
+            group.leave()
+        }
+        
+        // 3. 酷我
+        group.enter()
+        searchKuwo(query: trimmed) { items in
+            lock.lock()
+            allResults.append(contentsOf: items)
+            lock.unlock()
+            group.leave()
+        }
+        
+        // 4. QQ音乐
+        group.enter()
+        searchQQ(query: trimmed) { items in
+            lock.lock()
+            allResults.append(contentsOf: items)
+            lock.unlock()
+            group.leave()
+        }
+        
+        // 超时控制 4.0s 并发聚合
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = group.wait(timeout: .now() + 4.0)
+            
+            lock.lock()
+            let rawList = allResults
+            lock.unlock()
+            
+            // 去重 (基于平台与 id)
+            var seenIds = Set<String>()
+            var uniqueItems: [SearchTrackItem] = []
+            for item in rawList {
+                if !seenIds.contains(item.id) {
+                    seenIds.insert(item.id)
+                    uniqueItems.append(item)
+                }
+            }
+            
+            // 按综合置信度与相关度排序
+            let ranked = Self.rankSearchResults(items: uniqueItems, query: trimmed)
+            
+            DispatchQueue.main.async {
+                completion(ranked)
+            }
+        }
+    }
+    
+    // 搜索结果多维综合排序
+    private static func rankSearchResults(items: [SearchTrackItem], query: String) -> [SearchTrackItem] {
+        let cleanQ = toSimplified(cleanTrackTitle(query)).lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        return items.sorted { a, b in
+            let scoreA = calculateItemSearchScore(item: a, cleanQuery: cleanQ)
+            let scoreB = calculateItemSearchScore(item: b, cleanQuery: cleanQ)
+            if scoreA != scoreB {
+                return scoreA > scoreB
+            }
+            return a.durationSeconds > b.durationSeconds
+        }
+    }
+    
+    private static func calculateItemSearchScore(item: SearchTrackItem, cleanQuery: String) -> Double {
+        var score: Double = 0.0
+        let cleanTitle = toSimplified(cleanTrackTitle(item.title)).lowercased()
+        let cleanArtist = toSimplified(MultiFactorScorer.normalizeArtist(item.artist)).lowercased()
+        
+        if cleanTitle == cleanQuery {
+            score += 40.0
+        } else if cleanTitle.contains(cleanQuery) {
+            score += 25.0
+        } else if cleanQuery.contains(cleanTitle) && cleanTitle.count >= 2 {
+            score += 20.0
+        }
+        
+        if cleanArtist == cleanQuery {
+            score += 35.0
+        } else if cleanArtist.contains(cleanQuery) {
+            score += 20.0
+        } else if cleanQuery.contains(cleanArtist) && cleanArtist.count >= 2 {
+            score += 15.0
+        }
+        
+        if (cleanTitle + " " + cleanArtist).contains(cleanQuery) {
+            score += 10.0
+        }
+        
+        if item.qualityTag == "FLAC" {
+            score += 8.0
+        } else if item.qualityTag == "320K" {
+            score += 4.0
+        }
+        
+        let fullText = (item.title + " " + item.artist + " " + item.album).lowercased()
+        for kw in MultiFactorScorer.negativeKeywords {
+            let kwSimp = toSimplified(kw).lowercased()
+            if !cleanQuery.contains(kwSimp) && fullText.contains(kwSimp) {
+                score -= 25.0
+            }
+        }
+        
+        return score
+    }
+    
+    // MARK: - 源 1: 网易云检索
+    private func searchNetease(query: String, completion: @escaping ([SearchTrackItem]) -> Void) {
+        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "https://music.163.com/api/cloudsearch/pc?s=\(encoded)&type=1&limit=15") else {
             completion([])
             return
         }
         
         var req = URLRequest(url: url)
         req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
-        req.timeoutInterval = 6.0
+        req.timeoutInterval = 4.0
         
         URLSession.shared.dataTask(with: req) { data, _, _ in
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let result = json["result"] as? [String: Any],
                   let songs = result["songs"] as? [[String: Any]] else {
-                DispatchQueue.main.async { completion([]) }
+                completion([])
                 return
             }
             
@@ -2066,7 +2252,6 @@ class SongDownloadEngine: ObservableObject {
                 let dtMs = s["dt"] as? Double ?? (s["duration"] as? Double ?? 0.0)
                 let durSec = dtMs / 1000.0
                 
-                // 探测最高码率音质标签
                 var qualityTag = "320K"
                 if s["hr"] != nil || s["sq"] != nil {
                     qualityTag = "FLAC"
@@ -2081,18 +2266,244 @@ class SongDownloadEngine: ObservableObject {
                 }
                 
                 items.append(SearchTrackItem(
-                    id: id,
+                    id: "netease_\(id)",
+                    numericId: id,
+                    source: .netease,
                     title: name,
                     artist: artistName,
                     album: albumName,
                     durationSeconds: durSec,
-                    qualityTag: qualityTag
+                    qualityTag: qualityTag,
+                    extraData: ["id": "\(id)"]
                 ))
             }
-            
-            DispatchQueue.main.async {
-                completion(items)
+            completion(items)
+        }.resume()
+    }
+    
+    // MARK: - 源 2: 酷狗检索
+    private func searchKugou(query: String, completion: @escaping ([SearchTrackItem]) -> Void) {
+        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "http://mobilecdn.kugou.com/api/v3/search/song?format=json&keyword=\(encoded)&page=1&pagesize=15&showtype=1") else {
+            completion([])
+            return
+        }
+        
+        var req = URLRequest(url: url)
+        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
+        req.timeoutInterval = 4.0
+        
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let dataObj = json["data"] as? [String: Any],
+                  let info = dataObj["info"] as? [[String: Any]] else {
+                completion([])
+                return
             }
+            
+            var items: [SearchTrackItem] = []
+            for s in info {
+                guard let hash = s["hash"] as? String, !hash.isEmpty else { continue }
+                
+                var songName = (s["songname"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                var singerName = (s["singername"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let fileName = s["filename"] as? String ?? ""
+                
+                if songName.isEmpty && fileName.contains(" - ") {
+                    let parts = fileName.components(separatedBy: " - ")
+                    if parts.count >= 2 {
+                        singerName = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
+                        songName = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                    } else {
+                        songName = fileName
+                    }
+                }
+                if singerName.isEmpty { singerName = "未知歌手" }
+                if songName.isEmpty { songName = fileName.isEmpty ? "未知曲目" : fileName }
+                
+                let albumName = s["album_name"] as? String ?? ""
+                let dur: Double = {
+                    if let d = s["duration"] as? Double { return d }
+                    if let i = s["duration"] as? Int { return Double(i) }
+                    if let str = s["duration"] as? String, let val = Double(str) { return val }
+                    return 0.0
+                }()
+                
+                let sqHash = s["sqhash"] as? String ?? ""
+                let h320Hash = s["320hash"] as? String ?? ""
+                let qualityTag = !sqHash.isEmpty ? "FLAC" : (!h320Hash.isEmpty ? "320K" : "128K")
+                
+                let albumId: String
+                if let aidStr = s["album_id"] as? String {
+                    albumId = aidStr
+                } else if let aidInt = s["album_id"] as? Int {
+                    albumId = "\(aidInt)"
+                } else {
+                    albumId = ""
+                }
+                
+                items.append(SearchTrackItem(
+                    id: "kugou_\(hash)",
+                    numericId: 0,
+                    source: .kugou,
+                    title: songName,
+                    artist: singerName,
+                    album: albumName,
+                    durationSeconds: dur,
+                    qualityTag: qualityTag,
+                    extraData: ["hash": hash, "album_id": albumId, "sqhash": sqHash, "320hash": h320Hash]
+                ))
+            }
+            completion(items)
+        }.resume()
+    }
+    
+    // MARK: - 源 3: 酷我检索
+    private func searchKuwo(query: String, completion: @escaping ([SearchTrackItem]) -> Void) {
+        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "http://search.kuwo.cn/r.s?client=kt&all=\(encoded)&pn=0&rn=15&uid=794762528&ver=kwplayer_ar_9.2.2.1&vipver=1&show_copyright_off=1&newsearch=1&ft=music&cluster=0&strategy=2012&encoding=utf8&rformat=json&vermerge=1&mobi=1") else {
+            completion([])
+            return
+        }
+        
+        var req = URLRequest(url: url)
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
+        req.timeoutInterval = 4.0
+        
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data = data else {
+                completion([])
+                return
+            }
+            
+            let abslist: [[String: Any]]? = {
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let list = json["abslist"] as? [[String: Any]] {
+                    return list
+                }
+                if var text = String(data: data, encoding: .utf8) {
+                    text = text.replacingOccurrences(of: "'", with: "\"")
+                    if let cleanData = text.data(using: .utf8),
+                       let json = try? JSONSerialization.jsonObject(with: cleanData) as? [String: Any],
+                       let list = json["abslist"] as? [[String: Any]] {
+                        return list
+                    }
+                }
+                return nil
+            }()
+            
+            guard let abslist = abslist else {
+                completion([])
+                return
+            }
+            
+            var items: [SearchTrackItem] = []
+            for s in abslist {
+                guard let rawRid = (s["MUSICRID"] as? String) ?? (s["musicrid"] as? String) else { continue }
+                let rid = rawRid.replacingOccurrences(of: "MUSIC_", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !rid.isEmpty else { continue }
+                
+                var songName = (s["SONGNAME"] as? String) ?? (s["name"] as? String) ?? "未知曲目"
+                songName = songName.replacingOccurrences(of: "&nbsp;", with: " ")
+                    .replacingOccurrences(of: "&amp;", with: "&")
+                    .replacingOccurrences(of: "&quot;", with: "\"")
+                
+                var artistName = (s["ARTIST"] as? String) ?? (s["artist"] as? String) ?? "未知歌手"
+                artistName = artistName.replacingOccurrences(of: "&nbsp;", with: " ")
+                    .replacingOccurrences(of: "&amp;", with: "&")
+                
+                var albumName = (s["ALBUM"] as? String) ?? (s["album"] as? String) ?? ""
+                albumName = albumName.replacingOccurrences(of: "&nbsp;", with: " ")
+                    .replacingOccurrences(of: "&amp;", with: "&")
+                
+                var durSec: Double = 0.0
+                if let durInt = s["DURATION"] as? Int {
+                    durSec = Double(durInt)
+                } else if let durStr = s["DURATION"] as? String, let durVal = Double(durStr) {
+                    durSec = durVal
+                }
+                
+                let formats = ((s["FORMATS"] as? String) ?? "").uppercased()
+                let qualityTag = formats.contains("FLAC") ? "FLAC" : (formats.contains("320") ? "320K" : "128K")
+                
+                let numId = Int(rid) ?? 0
+                items.append(SearchTrackItem(
+                    id: "kuwo_\(rid)",
+                    numericId: numId,
+                    source: .kuwo,
+                    title: songName,
+                    artist: artistName,
+                    album: albumName,
+                    durationSeconds: durSec,
+                    qualityTag: qualityTag,
+                    extraData: ["rid": rid]
+                ))
+            }
+            completion(items)
+        }.resume()
+    }
+    
+    // MARK: - 源 4: QQ音乐检索
+    private func searchQQ(query: String, completion: @escaping ([SearchTrackItem]) -> Void) {
+        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w=\(encoded)&format=json&n=15") else {
+            completion([])
+            return
+        }
+        
+        var req = URLRequest(url: url)
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
+        req.setValue("https://y.qq.com/", forHTTPHeaderField: "Referer")
+        req.timeoutInterval = 4.0
+        
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let dataObj = json["data"] as? [String: Any],
+                  let songObj = dataObj["song"] as? [String: Any],
+                  let songList = songObj["list"] as? [[String: Any]] else {
+                completion([])
+                return
+            }
+            
+            var items: [SearchTrackItem] = []
+            for s in songList {
+                guard let songmid = s["songmid"] as? String, !songmid.isEmpty,
+                      let songname = s["songname"] as? String else { continue }
+                
+                var artistName = "未知歌手"
+                if let singers = s["singer"] as? [[String: Any]], !singers.isEmpty {
+                    artistName = singers.compactMap { $0["name"] as? String }.joined(separator: ", ")
+                }
+                
+                let albumname = s["albumname"] as? String ?? ""
+                let interval: Double = {
+                    if let d = s["interval"] as? Double { return d }
+                    if let i = s["interval"] as? Int { return Double(i) }
+                    if let str = s["interval"] as? String, let val = Double(str) { return val }
+                    return 0.0
+                }()
+                
+                let sizeflac = s["sizeflac"] as? Int ?? 0
+                let size320 = s["size320"] as? Int ?? 0
+                let qualityTag = sizeflac > 0 ? "FLAC" : (size320 > 0 ? "320K" : "128K")
+                
+                let songid = s["songid"] as? Int ?? 0
+                
+                items.append(SearchTrackItem(
+                    id: "qq_\(songmid)",
+                    numericId: songid,
+                    source: .qq,
+                    title: songname,
+                    artist: artistName,
+                    album: albumname,
+                    durationSeconds: interval,
+                    qualityTag: qualityTag,
+                    extraData: ["songmid": songmid, "songid": "\(songid)"]
+                ))
+            }
+            completion(items)
         }.resume()
     }
     
@@ -2110,23 +2521,303 @@ class SongDownloadEngine: ObservableObject {
         }
     }
     
+    // MARK: - 分布式直链解析分发器 (Custom API 优先 -> 跨平台分发)
+    func fetchDirectAudioUrl(candidate: SearchTrackItem, completion: @escaping (String?, String?) -> Void) {
+        // 1. 用户自定义 API 节点优先判定
+        if let customApi = DownloadConfig.shared.customApiUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !customApi.isEmpty {
+            fetchFromCustomApi(customApi: customApi, candidate: candidate) { [weak self] directUrl, format in
+                if let directUrl = directUrl, !directUrl.isEmpty {
+                    completion(directUrl, format ?? "mp3")
+                } else {
+                    // 自定义 API 未命中或失败，平滑降级至平台内置解析通道
+                    self?.fetchPlatformDirectUrl(candidate: candidate, completion: completion)
+                }
+            }
+            return
+        }
+        
+        // 2. 走平台内置直链解析通道
+        fetchPlatformDirectUrl(candidate: candidate, completion: completion)
+    }
+    
+    private func fetchPlatformDirectUrl(candidate: SearchTrackItem, completion: @escaping (String?, String?) -> Void) {
+        switch candidate.source {
+        case .netease:
+            fetchNeteaseAudioUrl(id: candidate.numericId, completion: completion)
+        case .kuwo:
+            fetchKuwoAudioUrl(candidate: candidate, completion: completion)
+        case .kugou:
+            fetchKugouAudioUrl(candidate: candidate, completion: completion)
+        case .qq:
+            fetchQQAudioUrl(candidate: candidate, completion: completion)
+        case .all:
+            completion(nil, nil)
+        }
+    }
+    
+    // 通用自定义 API 解析
+    private func fetchFromCustomApi(customApi: String, candidate: SearchTrackItem, completion: @escaping (String?, String?) -> Void) {
+        var targetUrlStr = customApi
+        let encId = candidate.id.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        let encTitle = candidate.title.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        let encArtist = candidate.artist.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        
+        if targetUrlStr.contains("{id}") || targetUrlStr.contains("{source}") {
+            targetUrlStr = targetUrlStr
+                .replacingOccurrences(of: "{id}", with: encId)
+                .replacingOccurrences(of: "{numericId}", with: "\(candidate.numericId)")
+                .replacingOccurrences(of: "{source}", with: candidate.source.rawValue)
+                .replacingOccurrences(of: "{title}", with: encTitle)
+                .replacingOccurrences(of: "{artist}", with: encArtist)
+        } else {
+            let sep = targetUrlStr.contains("?") ? "&" : "?"
+            targetUrlStr = "\(targetUrlStr)\(sep)id=\(encId)&source=\(candidate.source.rawValue)&title=\(encTitle)&artist=\(encArtist)"
+        }
+        
+        guard let url = URL(string: targetUrlStr) else {
+            completion(nil, nil)
+            return
+        }
+        
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 4.0
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
+        
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data = data else {
+                completion(nil, nil)
+                return
+            }
+            
+            if let direct = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), direct.hasPrefix("http") {
+                let ext = direct.lowercased().contains(".flac") ? "flac" : "mp3"
+                completion(direct, ext)
+                return
+            }
+            
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let urlStr = (json["url"] as? String)
+                    ?? ((json["data"] as? [String: Any])?["url"] as? String)
+                    ?? (json["data"] as? String)
+                if let direct = urlStr, direct.hasPrefix("http") {
+                    let ext = direct.lowercased().contains(".flac") ? "flac" : "mp3"
+                    completion(direct, ext)
+                    return
+                }
+            }
+            completion(nil, nil)
+        }.resume()
+    }
+    
+    // 网易云直链 (三通道: Meting 302 -> Paugram -> Meting 直链跟随)
+    private func fetchNeteaseAudioUrl(id: Int, completion: @escaping (String?, String?) -> Void) {
+        if id <= 0 {
+            completion(nil, nil)
+            return
+        }
+        
+        let metingUrlStr = "https://api.injahow.cn/meting/?type=url&id=\(id)"
+        guard let metingUrl = URL(string: metingUrlStr) else {
+            completion(nil, nil)
+            return
+        }
+        
+        let delegate = RedirectCatchDelegate()
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        var headReq = URLRequest(url: metingUrl)
+        headReq.httpMethod = "HEAD"
+        headReq.timeoutInterval = 4.0
+        headReq.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
+        
+        session.dataTask(with: headReq) { [weak self] _, resp, _ in
+            guard let self = self else { return }
+            
+            let location = delegate.redirectedURLString
+                ?? (resp as? HTTPURLResponse)?.allHeaderFields["Location"] as? String
+                ?? (resp as? HTTPURLResponse)?.allHeaderFields["location"] as? String
+            
+            if let loc = location, !loc.isEmpty, !loc.contains("404"), loc.hasPrefix("http") {
+                let ext = loc.lowercased().contains(".flac") ? "flac" : "mp3"
+                completion(loc, ext)
+                return
+            }
+            
+            self.fetchPaugramAudioUrl(id: id) { paugramLink in
+                if let link = paugramLink, !link.isEmpty, !link.contains("404"), link.hasPrefix("http") {
+                    let ext = link.lowercased().contains(".flac") ? "flac" : "mp3"
+                    completion(link, ext)
+                    return
+                }
+                completion(metingUrlStr, "mp3")
+            }
+        }.resume()
+    }
+    
+    private func fetchPaugramAudioUrl(id: Int, completion: @escaping (String?) -> Void) {
+        guard let paugramUrl = URL(string: "https://api.paugram.com/netease/?id=\(id)") else {
+            completion(nil)
+            return
+        }
+        var req = URLRequest(url: paugramUrl)
+        req.timeoutInterval = 4.0
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
+        
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let link = json["link"] as? String,
+                  !link.isEmpty,
+                  !link.contains("404"),
+                  link.hasPrefix("http") else {
+                completion(nil)
+                return
+            }
+            completion(link)
+        }.resume()
+    }
+    
+    // 酷我直链解析 (Antiserver Convert URL)
+    private func fetchKuwoAudioUrl(candidate: SearchTrackItem, completion: @escaping (String?, String?) -> Void) {
+        let rid = candidate.extraData["rid"] ?? "\(candidate.numericId)"
+        guard !rid.isEmpty, rid != "0" else {
+            completion(nil, nil)
+            return
+        }
+        
+        let urlStr = "http://antiserver.kuwo.cn/anti.s?type=convert_url&rid=\(rid)&format=mp3&response=url"
+        guard let url = URL(string: urlStr) else {
+            completion(nil, nil)
+            return
+        }
+        
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 4.0
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
+        
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data = data else {
+                completion(nil, nil)
+                return
+            }
+            
+            if let direct = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), direct.hasPrefix("http") {
+                let ext = direct.lowercased().contains(".flac") ? "flac" : "mp3"
+                completion(direct, ext)
+                return
+            }
+            
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let direct = json["url"] as? String, direct.hasPrefix("http") {
+                let ext = direct.lowercased().contains(".flac") ? "flac" : "mp3"
+                completion(direct, ext)
+                return
+            }
+            
+            completion(nil, nil)
+        }.resume()
+    }
+    
+    // 酷狗移动端直链解析
+    private func fetchKugouAudioUrl(candidate: SearchTrackItem, completion: @escaping (String?, String?) -> Void) {
+        let hash = candidate.extraData["hash"] ?? candidate.id.replacingOccurrences(of: "kugou_", with: "")
+        guard !hash.isEmpty else {
+            completion(nil, nil)
+            return
+        }
+        
+        let urlStr = "https://m.kugou.com/app/i/getSongInfo.php?cmd=playInfo&hash=\(hash)"
+        guard let url = URL(string: urlStr) else {
+            completion(nil, nil)
+            return
+        }
+        
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 4.0
+        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
+        
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let self = self else { return }
+            if let data = data,
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let playUrl = json["url"] as? String, playUrl.hasPrefix("http"), !playUrl.isEmpty {
+                    let ext = playUrl.lowercased().contains(".flac") ? "flac" : "mp3"
+                    completion(playUrl, ext)
+                    return
+                }
+                if let backups = json["backup_url"] as? [String], let first = backups.first, first.hasPrefix("http") {
+                    let ext = first.lowercased().contains(".flac") ? "flac" : "mp3"
+                    completion(first, ext)
+                    return
+                }
+            }
+            
+            let albumId = candidate.extraData["album_id"] ?? ""
+            self.fetchKugouWebPlayData(hash: hash, albumId: albumId, completion: completion)
+        }.resume()
+    }
+    
+    private func fetchKugouWebPlayData(hash: String, albumId: String, completion: @escaping (String?, String?) -> Void) {
+        var comp = URLComponents(string: "http://www.kugou.com/yy/index.php")
+        comp?.queryItems = [
+            URLQueryItem(name: "r", value: "play/getdata"),
+            URLQueryItem(name: "hash", value: hash),
+            URLQueryItem(name: "album_id", value: albumId)
+        ]
+        guard let url = comp?.url else {
+            completion(nil, nil)
+            return
+        }
+        
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 4.0
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
+        req.setValue("kg_mid=23333333333333333333333333333333", forHTTPHeaderField: "Cookie")
+        
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let dataObj = json["data"] as? [String: Any] else {
+                completion(nil, nil)
+                return
+            }
+            
+            if let playUrl = dataObj["play_url"] as? String, playUrl.hasPrefix("http"), !playUrl.isEmpty {
+                let ext = playUrl.lowercased().contains(".flac") ? "flac" : "mp3"
+                completion(playUrl, ext)
+                return
+            }
+            if let playBackup = dataObj["play_backup_url"] as? String, playBackup.hasPrefix("http"), !playBackup.isEmpty {
+                let ext = playBackup.lowercased().contains(".flac") ? "flac" : "mp3"
+                completion(playBackup, ext)
+                return
+            }
+            
+            completion(nil, nil)
+        }.resume()
+    }
+    
+    // QQ音乐直链解析
+    private func fetchQQAudioUrl(candidate: SearchTrackItem, completion: @escaping (String?, String?) -> Void) {
+        completion(nil, nil)
+    }
+    
     // MARK: - 单候选下载与物理时长门禁校验
     private func downloadSingleCandidate(
         candidate: SearchTrackItem,
         targetTitle: String,
         targetArtist: String,
         targetDuration: Double,
-        uiTrackId: Int,
+        uiTrackId: String,
         completion: @escaping (Bool, String) -> Void
     ) {
-        fetchDirectAudioUrl(id: candidate.id) { [weak self] audioUrlStr, formatType in
+        fetchDirectAudioUrl(candidate: candidate) { [weak self] audioUrlStr, formatType in
             guard let self = self else {
                 completion(false, "实例已释放")
                 return
             }
             
             guard let audioUrlStr = audioUrlStr, let audioDownloadUrl = URL(string: audioUrlStr) else {
-                completion(false, "未能获取到音频直链")
+                completion(false, "未能获取到 [\(candidate.source.rawValue)] 音频直链")
                 return
             }
             
@@ -2169,7 +2860,7 @@ class SongDownloadEngine: ObservableObject {
                 case .fail(let reason, let actualSec):
                     // 门禁拦截！立即删除临时文件
                     try? FileManager.default.removeItem(at: workingTempURL)
-                    NSLog("[AntiPreviewGate] 拦截候选 id=\(candidate.id) (\(candidate.title) - \(candidate.artist)): \(reason)")
+                    NSLog("[AntiPreviewGate] 拦截候选 id=\(candidate.id) [\(candidate.source.rawValue)] (\(candidate.title) - \(candidate.artist)): \(reason)")
                     completion(false, "防试听门禁拦截: \(reason) (\(String(format: "%.1f", actualSec))s)")
                     
                 case .pass(let actualSec):
@@ -2197,7 +2888,7 @@ class SongDownloadEngine: ObservableObject {
                     }
                     
                     // 并发拉取并保存同名 LRC 歌词
-                    self.fetchAndSaveLrc(id: candidate.id, title: finalTitle, artist: finalArtist, album: candidate.album, destURL: lrcDestURL) { _ in
+                    self.fetchAndSaveLrc(candidate: candidate, title: finalTitle, artist: finalArtist, album: candidate.album, destURL: lrcDestURL) { _ in
                         DispatchQueue.main.async {
                             self.activeDownloads[uiTrackId] = .completed
                             self.notifyDownloadComplete(title: finalTitle, artist: finalArtist, audioURL: audioDestURL, lrcURL: lrcDestURL)
@@ -2210,18 +2901,18 @@ class SongDownloadEngine: ObservableObject {
         }
     }
     
-    // MARK: - 候选队列换源轮询下载器
+    // MARK: - 跨平台换源轮询候选队列下载器
     private func downloadCandidateQueue(
         queue: [SearchTrackItem],
         index: Int,
         targetTitle: String,
         targetArtist: String,
         targetDuration: Double,
-        uiTrackId: Int,
+        uiTrackId: String,
         completion: ((Bool, String) -> Void)?
     ) {
         if index >= queue.count {
-            // 队列所有候选源均尝试完毕，尝试本地 yt-dlp 兜底
+            // 全网多源候选均已尝试完毕，自动转入本地 yt-dlp 兜底
             let destDir = DownloadConfig.shared.downloadDirectoryURL
             let safeTitle = DownloadConfig.cleanFileName(targetTitle)
             let safeArtist = DownloadConfig.cleanFileName(targetArtist)
@@ -2230,7 +2921,7 @@ class SongDownloadEngine: ObservableObject {
             
             fallbackWithYtDlp(title: targetTitle, artist: targetArtist, targetDuration: targetDuration, destDir: destDir, lrcDestURL: lrcDestURL, trackId: uiTrackId) { success, msg in
                 if !success {
-                    let failMsg = "所有公开音源均为试听片段（或受版权限制），已拦截保存残卷"
+                    let failMsg = "全网多平台音源均为试听片段（或受版权限制），已拦截保存残卷"
                     DispatchQueue.main.async {
                         self.activeDownloads[uiTrackId] = .failed(error: failMsg)
                         completion?(false, failMsg)
@@ -2247,7 +2938,7 @@ class SongDownloadEngine: ObservableObject {
         let totalCount = queue.count
         
         DispatchQueue.main.async {
-            self.activeDownloads[uiTrackId] = .downloading(progressText: "正在尝试第 \(currentStep)/\(totalCount) 个音源 (\(candidate.qualityTag))...")
+            self.activeDownloads[uiTrackId] = .downloading(progressText: "正在尝试第 \(currentStep)/\(totalCount) 个音源 [\(candidate.source.rawValue) - \(candidate.qualityTag)]...")
         }
         
         downloadSingleCandidate(candidate: candidate, targetTitle: targetTitle, targetArtist: targetArtist, targetDuration: targetDuration, uiTrackId: uiTrackId) { [weak self] success, msg in
@@ -2255,32 +2946,32 @@ class SongDownloadEngine: ObservableObject {
             if success {
                 completion?(true, msg)
             } else {
-                // 当前源失败或被门禁拦截，自动尝试队列中下一个音源！
+                // 当前源受限或被门禁拦截，自动跨平台无感尝试下一个音源！
                 DispatchQueue.main.async {
-                    self.activeDownloads[uiTrackId] = .downloading(progressText: "音源 \(currentStep) 未通过门禁，正在换源重试...")
+                    self.activeDownloads[uiTrackId] = .downloading(progressText: "[\(candidate.source.rawValue)] 未通过门禁，正在跨平台换源重试...")
                 }
                 self.downloadCandidateQueue(queue: queue, index: index + 1, targetTitle: targetTitle, targetArtist: targetArtist, targetDuration: targetDuration, uiTrackId: uiTrackId, completion: completion)
             }
         }
     }
     
-    // 下载曲目 (最高音质音频 + 同步 LRC 歌词，支持试听自动换源)
+    // 下载曲目 (多平台分布式直链 + 防试听门禁 + 跨平台自动换源)
     func downloadTrack(item: SearchTrackItem, completion: ((Bool, String) -> Void)? = nil) {
         DownloadConfig.shared.ensureDirectoryExists()
         
         DispatchQueue.main.async {
-            self.activeDownloads[item.id] = .downloading(progressText: "获取最高音质链接...")
+            self.activeDownloads[item.id] = .downloading(progressText: "获取 [\(item.source.rawValue)] 最高音质链接...")
         }
         
-        // 首先以当前 item 作为首选进行尝试
+        // 1. 首先以当前 item 作为首选尝试
         self.downloadSingleCandidate(candidate: item, targetTitle: item.title, targetArtist: item.artist, targetDuration: item.durationSeconds, uiTrackId: item.id) { [weak self] success, msg in
             guard let self = self else { return }
             if success {
                 completion?(true, msg)
             } else {
-                // 当前 item 失败或未通过门禁（试听残卷），自动触发换源轮询！
+                // 2. 当前 item 失败或未通过门禁（试听残卷），无感触发跨平台全网自动换源轮询！
                 DispatchQueue.main.async {
-                    self.activeDownloads[item.id] = .downloading(progressText: "原音源受限/试听，正在自动换源检索...")
+                    self.activeDownloads[item.id] = .downloading(progressText: "[\(item.source.rawValue)] 音源受限/试听，正在全网跨平台换源...")
                 }
                 self.searchTracks(query: "\(item.title) \(item.artist)") { [weak self] candidates in
                     guard let self = self else { return }
@@ -2290,7 +2981,7 @@ class SongDownloadEngine: ObservableObject {
                     if !ranked.isEmpty {
                         self.downloadCandidateQueue(queue: ranked, index: 0, targetTitle: item.title, targetArtist: item.artist, targetDuration: item.durationSeconds, uiTrackId: item.id, completion: completion)
                     } else {
-                        // 无其他候选，尝试 yt-dlp
+                        // 无其他跨平台候选，尝试 yt-dlp 兜底
                         let destDir = DownloadConfig.shared.downloadDirectoryURL
                         let safeTitle = DownloadConfig.cleanFileName(item.title)
                         let safeArtist = DownloadConfig.cleanFileName(item.artist)
@@ -2299,7 +2990,7 @@ class SongDownloadEngine: ObservableObject {
                         
                         self.fallbackWithYtDlp(title: item.title, artist: item.artist, targetDuration: item.durationSeconds, destDir: destDir, lrcDestURL: lrcDestURL, trackId: item.id) { ytSuccess, ytMsg in
                             if !ytSuccess {
-                                let failMsg = "各接口均仅提供试听片段，已阻止保存残卷"
+                                let failMsg = "全网多平台接口均仅提供试听片段，已阻止保存残卷"
                                 DispatchQueue.main.async {
                                     self.activeDownloads[item.id] = .failed(error: failMsg)
                                     completion?(false, failMsg)
@@ -2314,91 +3005,16 @@ class SongDownloadEngine: ObservableObject {
         }
     }
     
-    // 获取音频直链 (三通道架构: 通道 1 Meting 302 -> 通道 2 Paugram -> 通道 3 Meting 原链自动跟随)
-    private func fetchDirectAudioUrl(id: Int, completion: @escaping (String?, String?) -> Void) {
-        if id <= 0 {
-            completion(nil, nil)
-            return
-        }
-        
-        let metingUrlStr = "https://api.injahow.cn/meting/?type=url&id=\(id)"
-        guard let metingUrl = URL(string: metingUrlStr) else {
-            completion(nil, nil)
-            return
-        }
-        
-        // 通道 1: Meting 直链解析接口捕获 302 重定向后的真实 Location
-        let delegate = RedirectCatchDelegate()
-        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
-        var headReq = URLRequest(url: metingUrl)
-        headReq.httpMethod = "HEAD"
-        headReq.timeoutInterval = 4.0
-        headReq.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
-        
-        session.dataTask(with: headReq) { [weak self] _, resp, _ in
-            guard let self = self else { return }
-            
-            let location = delegate.redirectedURLString
-                ?? (resp as? HTTPURLResponse)?.allHeaderFields["Location"] as? String
-                ?? (resp as? HTTPURLResponse)?.allHeaderFields["location"] as? String
-            
-            if let loc = location, !loc.isEmpty, !loc.contains("404"), loc.hasPrefix("http") {
-                let ext = loc.lowercased().contains(".flac") ? "flac" : "mp3"
-                completion(loc, ext)
-                return
-            }
-            
-            // 通道 2: Paugram 备用接口获取 link
-            self.fetchPaugramAudioUrl(id: id) { paugramLink in
-                if let link = paugramLink, !link.isEmpty, !link.contains("404"), link.hasPrefix("http") {
-                    let ext = link.lowercased().contains(".flac") ? "flac" : "mp3"
-                    completion(link, ext)
-                    return
-                }
-                
-                // 通道 3: Meting 直链原地址交由 URLSession 自动跟随 302 重定向下载
-                completion(metingUrlStr, "mp3")
-            }
-        }.resume()
-    }
-    
-    // 通道 2: Paugram 备用接口解析
-    private func fetchPaugramAudioUrl(id: Int, completion: @escaping (String?) -> Void) {
-        guard let paugramUrl = URL(string: "https://api.paugram.com/netease/?id=\(id)") else {
-            completion(nil)
-            return
-        }
-        var req = URLRequest(url: paugramUrl)
-        req.timeoutInterval = 4.0
-        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
-        
-        URLSession.shared.dataTask(with: req) { data, _, _ in
-            guard let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let link = json["link"] as? String,
-                  !link.isEmpty,
-                  !link.contains("404"),
-                  link.hasPrefix("http") else {
-                completion(nil)
-                return
-            }
-            completion(link)
-        }.resume()
-    }
-    
     // 通过文件头魔数或 HTTP 响应判定音频扩展名 (.mp3 或 .flac)
     private func detectAudioExtension(fileURL: URL, response: URLResponse?, fallbackFormat: String?) -> String {
-        // 1. 读取文件头前 4 字节魔数判定 FLAC
         if let fileHandle = try? FileHandle(forReadingFrom: fileURL) {
             defer { try? fileHandle.close() }
             let headerData = fileHandle.readData(ofLength: 4)
-            // FLAC 格式魔数: 0x66 0x4C 0x61 0x43 ("fLaC")
             if headerData.count >= 4 && headerData.starts(with: [0x66, 0x4C, 0x61, 0x43]) {
                 return "flac"
             }
         }
         
-        // 2. 检查 HTTP 响应 MIME 类型
         if let mime = response?.mimeType?.lowercased() {
             if mime.contains("flac") {
                 return "flac"
@@ -2407,13 +3023,11 @@ class SongDownloadEngine: ObservableObject {
             }
         }
         
-        // 3. 检查重定向后的实际 URL 路径后缀
         if let respUrl = response?.url?.pathExtension.lowercased(), !respUrl.isEmpty {
             if respUrl == "flac" { return "flac" }
             if respUrl == "mp3" { return "mp3" }
         }
         
-        // 4. 检查 fallbackFormat
         if let fallback = fallbackFormat?.lowercased(), fallback == "flac" {
             return "flac"
         }
@@ -2422,7 +3036,7 @@ class SongDownloadEngine: ObservableObject {
     }
     
     // 抓取并写入格式化 LRC
-    private func fetchAndSaveLrc(id: Int, title: String, artist: String, album: String, destURL: URL, completion: @escaping (Bool) -> Void) {
+    private func fetchAndSaveLrc(candidate: SearchTrackItem, title: String, artist: String, album: String, destURL: URL, completion: @escaping (Bool) -> Void) {
         let writeLrcBlock: (String) -> Void = { lrcContent in
             var header = ""
             if !lrcContent.contains("[ti:") { header += "[ti:\(title)]\n" }
@@ -2441,11 +3055,13 @@ class SongDownloadEngine: ObservableObject {
             }
         }
         
-        if id > 0, let lrcApiUrl = URL(string: "https://music.163.com/api/song/lyric?os=pc&id=\(id)&lv=-1&kv=-1&tv=-1") {
+        // 若为网易云音源，优先通过网易官方 API 获取原生 LRC
+        if candidate.source == .netease && candidate.numericId > 0,
+           let lrcApiUrl = URL(string: "https://music.163.com/api/song/lyric?os=pc&id=\(candidate.numericId)&lv=-1&kv=-1&tv=-1") {
             var req = URLRequest(url: lrcApiUrl)
             req.timeoutInterval = 4.0
             
-            URLSession.shared.dataTask(with: req) { data, _, _ in
+            URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
                 if let data = data,
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let lrcObj = json["lrc"] as? [String: Any],
@@ -2454,50 +3070,43 @@ class SongDownloadEngine: ObservableObject {
                     return
                 }
                 
-                // 兜底：调用 LyricsEngine
-                LyricsEngine.shared.fetchLyrics(title: title, artist: artist, durationMs: 0) { lines in
-                    if let lines = lines, !lines.isEmpty {
-                        var reconstructed = ""
-                        for l in lines {
-                            let m = Int(l.time) / 60
-                            let s = l.time.truncatingRemainder(dividingBy: 60)
-                            reconstructed += String(format: "[%02d:%05.2f]%@\n", m, s, l.text)
-                        }
-                        writeLrcBlock(reconstructed)
-                    } else {
-                        writeLrcBlock("")
-                    }
-                }
+                // 网易云无歌词时走全网歌词引擎兜底
+                self?.fetchGenericLrc(title: title, artist: artist, writeBlock: writeLrcBlock)
             }.resume()
         } else {
-            LyricsEngine.shared.fetchLyrics(title: title, artist: artist, durationMs: 0) { lines in
-                if let lines = lines, !lines.isEmpty {
-                    var reconstructed = ""
-                    for l in lines {
-                        let m = Int(l.time) / 60
-                        let s = l.time.truncatingRemainder(dividingBy: 60)
-                        reconstructed += String(format: "[%02d:%05.2f]%@\n", m, s, l.text)
-                    }
-                    writeLrcBlock(reconstructed)
-                } else {
-                    writeLrcBlock("")
+            // 其他平台音源直接调用全网同步歌词引擎
+            fetchGenericLrc(title: title, artist: artist, writeBlock: writeLrcBlock)
+        }
+    }
+    
+    private func fetchGenericLrc(title: String, artist: String, writeBlock: @escaping (String) -> Void) {
+        LyricsEngine.shared.fetchLyrics(title: title, artist: artist, durationMs: 0) { lines in
+            if let lines = lines, !lines.isEmpty {
+                var reconstructed = ""
+                for l in lines {
+                    let m = Int(l.time) / 60
+                    let s = l.time.truncatingRemainder(dividingBy: 60)
+                    reconstructed += String(format: "[%02d:%05.2f]%@\n", m, s, l.text)
                 }
+                writeBlock(reconstructed)
+            } else {
+                writeBlock("")
             }
         }
     }
     
     // yt-dlp 兜底下载 (带物理时长门禁)
-    private func fallbackWithYtDlp(title: String, artist: String, targetDuration: Double, destDir: URL, lrcDestURL: URL, trackId: Int, completion: ((Bool, String) -> Void)?) {
+    private func fallbackWithYtDlp(title: String, artist: String, targetDuration: Double, destDir: URL, lrcDestURL: URL, trackId: String, completion: ((Bool, String) -> Void)?) {
         guard let ytdlpPath = findYtDlpPath() else {
             DispatchQueue.main.async {
-                self.activeDownloads[trackId] = .failed(error: "开放音源受版权保护且未检测到本地 yt-dlp 兜底工具")
+                self.activeDownloads[trackId] = .failed(error: "全网音源受版权保护且未检测到本地 yt-dlp 兜底工具")
                 completion?(false, "音源受版权保护且未检测到本地 yt-dlp")
             }
             return
         }
         
         DispatchQueue.main.async {
-            self.activeDownloads[trackId] = .downloading(progressText: "开放接口受限，正在通过本地 yt-dlp 兜底...")
+            self.activeDownloads[trackId] = .downloading(progressText: "全网公开接口受限，正在通过本地 yt-dlp 兜底...")
         }
         
         DispatchQueue.global(qos: .userInitiated).async {
@@ -2521,7 +3130,6 @@ class SongDownloadEngine: ObservableObject {
                 process.waitUntilExit()
                 
                 if process.terminationStatus == 0 && FileManager.default.fileExists(atPath: ytTempURL.path) {
-                    // yt-dlp 文件下载完成，执行 AntiPreviewGate 门禁校验
                     let gateResult = AntiPreviewGate.inspectAudio(at: ytTempURL, targetDuration: targetDuration)
                     switch gateResult {
                     case .fail(let reason, _):
@@ -2537,8 +3145,8 @@ class SongDownloadEngine: ObservableObject {
                         }
                         try FileManager.default.moveItem(at: ytTempURL, to: audioDestURL)
                         
-                        // 拉取歌词
-                        self.fetchAndSaveLrc(id: 0, title: title, artist: artist, album: "", destURL: lrcDestURL) { _ in
+                        let dummyItem = SearchTrackItem(id: "ytdlp", numericId: 0, source: .all, title: title, artist: artist, album: "", durationSeconds: actualSec, qualityTag: "320K", extraData: [:])
+                        self.fetchAndSaveLrc(candidate: dummyItem, title: title, artist: artist, album: "", destURL: lrcDestURL) { _ in
                             DispatchQueue.main.async {
                                 self.activeDownloads[trackId] = .completed
                                 self.notifyDownloadComplete(title: title, artist: artist, audioURL: audioDestURL, lrcURL: lrcDestURL)
@@ -2588,7 +3196,7 @@ class SongDownloadEngine: ObservableObject {
         return nil
     }
     
-    // 下载完成通知与 Finder 高亮定位
+    // 下载完成通知与 Finder 高亮定位、曲库刷新
     private func notifyDownloadComplete(title: String, artist: String, audioURL: URL, lrcURL: URL) {
         showSystemBanner(title: "已完成音乐与歌词下载", informativeText: "\(title) - \(artist)\n已保存至: \(DownloadConfig.shared.displayPath)")
         
@@ -2598,13 +3206,17 @@ class SongDownloadEngine: ObservableObject {
         if !targets.isEmpty {
             NSWorkspace.shared.activateFileViewerSelecting(targets)
         }
+        
+        // 自动通知本地音乐曲库重新扫描刷新
+        LocalMusicLibrary.shared.scanTracks()
     }
     
-    // 一键下载当前 Spotify 正在播放曲目 (三维评分过滤与自动换源轮询)
+    // 一键下载当前 Spotify 正在播放曲目 (四维多源聚合与跨平台自动换源)
     func downloadCurrentPlaying(title: String, artist: String, targetDuration: Double = 0, completion: ((Bool, String) -> Void)? = nil) {
         let cleanT = cleanTrackTitle(title)
         let cleanA = cleanArtistName(artist)
         let query = "\(cleanT) \(cleanA)"
+        let uiTrackId = "playing_\(cleanT)_\(cleanA)"
         
         searchTracks(query: query) { [weak self] items in
             guard let self = self else { return }
@@ -2612,19 +3224,18 @@ class SongDownloadEngine: ObservableObject {
             if items.isEmpty {
                 self.searchTracks(query: "\(title) \(artist)") { [weak self] fallbackItems in
                     guard let self = self else { return }
-                    self.processAndStartDownload(candidates: fallbackItems, targetTitle: title, targetArtist: artist, targetDuration: targetDuration, uiTrackId: 0, completion: completion)
+                    self.processAndStartDownload(candidates: fallbackItems, targetTitle: title, targetArtist: artist, targetDuration: targetDuration, uiTrackId: uiTrackId, completion: completion)
                 }
             } else {
-                self.processAndStartDownload(candidates: items, targetTitle: title, targetArtist: artist, targetDuration: targetDuration, uiTrackId: 0, completion: completion)
+                self.processAndStartDownload(candidates: items, targetTitle: title, targetArtist: artist, targetDuration: targetDuration, uiTrackId: uiTrackId, completion: completion)
             }
         }
     }
     
-    private func processAndStartDownload(candidates: [SearchTrackItem], targetTitle: String, targetArtist: String, targetDuration: Double, uiTrackId: Int, completion: ((Bool, String) -> Void)?) {
+    private func processAndStartDownload(candidates: [SearchTrackItem], targetTitle: String, targetArtist: String, targetDuration: Double, uiTrackId: String, completion: ((Bool, String) -> Void)?) {
         let ranked = MultiFactorScorer.rankCandidates(candidates: candidates, targetTitle: targetTitle, targetArtist: targetArtist, targetDuration: targetDuration)
         
         if ranked.isEmpty {
-            // 无高分候选通过歌手白名单，尝试 yt-dlp 兜底
             let destDir = DownloadConfig.shared.downloadDirectoryURL
             let safeTitle = DownloadConfig.cleanFileName(targetTitle)
             let safeArtist = DownloadConfig.cleanFileName(targetArtist)
@@ -2633,7 +3244,7 @@ class SongDownloadEngine: ObservableObject {
             
             self.fallbackWithYtDlp(title: targetTitle, artist: targetArtist, targetDuration: targetDuration, destDir: destDir, lrcDestURL: lrcDestURL, trackId: uiTrackId) { success, msg in
                 if !success {
-                    let failMsg = "未检索到匹配的完整正曲音源（候选歌手不符或均为试听）"
+                    let failMsg = "全网未检索到匹配的完整正曲音源（候选歌手不符或均为试听）"
                     DispatchQueue.main.async {
                         self.activeDownloads[uiTrackId] = .failed(error: failMsg)
                         completion?(false, failMsg)
@@ -2645,7 +3256,7 @@ class SongDownloadEngine: ObservableObject {
             return
         }
         
-        let effUiId = uiTrackId != 0 ? uiTrackId : (ranked.first?.id ?? 0)
+        let effUiId = !uiTrackId.isEmpty ? uiTrackId : (ranked.first?.id ?? "unknown")
         self.downloadCandidateQueue(queue: ranked, index: 0, targetTitle: targetTitle, targetArtist: targetArtist, targetDuration: targetDuration, uiTrackId: effUiId, completion: completion)
     }
 }
@@ -2655,8 +3266,16 @@ class SearchViewModel: ObservableObject {
     @Published var keyword: String = ""
     @Published var isSearching: Bool = false
     @Published var results: [SearchTrackItem] = []
+    @Published var selectedPlatform: MusicSourcePlatform = .all
     @Published var hasSearched: Bool = false
     @Published var errorMessage: String? = nil
+    
+    var filteredResults: [SearchTrackItem] {
+        if selectedPlatform == .all {
+            return results
+        }
+        return results.filter { $0.source == selectedPlatform }
+    }
     
     func search() {
         let trimmed = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2670,7 +3289,7 @@ class SearchViewModel: ObservableObject {
             self?.isSearching = false
             self?.results = items
             if items.isEmpty {
-                self?.errorMessage = "未检索到匹配的曲目，请更换关键词重试"
+                self?.errorMessage = "全网未检索到匹配的曲目，请更换关键词重试"
             }
         }
     }
@@ -2687,7 +3306,7 @@ struct SearchDownloadView: View {
             VisualEffectBackground(material: .hudWindow, blendingMode: .behindWindow, state: .active)
             
             VStack(spacing: 0) {
-                // 顶部标题与搜索栏
+                // 顶部标题、搜索栏与平台过滤胶囊
                 headerSearchBar
                     .padding(.horizontal, 18)
                     .padding(.top, 16)
@@ -2707,20 +3326,20 @@ struct SearchDownloadView: View {
                     .padding(.vertical, 10)
             }
         }
-        .frame(width: 580, height: 500)
+        .frame(width: 600, height: 530)
         .onExitCommand {
             SearchWindowManager.shared.closeWindow()
         }
     }
     
-    // 顶部搜索栏
+    // 顶部搜索栏与平台过滤
     private var headerSearchBar: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Image(systemName: "music.note.magnifyingglass")
                     .font(.system(size: 16, weight: .bold))
                     .foregroundColor(Color(red: 0.35, green: 0.95, blue: 0.90))
-                Text("音乐搜索与最高音质双轨下载")
+                Text("全网多源聚合搜索与分布式下载")
                     .font(.system(size: 14, weight: .bold, design: .rounded))
                     .foregroundColor(.white)
                 Spacer()
@@ -2735,7 +3354,7 @@ struct SearchDownloadView: View {
                         .font(.system(size: 13))
                         .foregroundColor(.white.opacity(0.50))
                     
-                    TextField("输入歌名、歌手或专辑，按回车搜索...", text: $vm.keyword)
+                    TextField("输入歌名、歌手或专辑，按回车全网搜索...", text: $vm.keyword)
                         .textFieldStyle(.plain)
                         .font(.system(size: 13, design: .rounded))
                         .foregroundColor(.white)
@@ -2773,7 +3392,7 @@ struct SearchDownloadView: View {
                             Image(systemName: "arrow.right.circle.fill")
                                 .font(.system(size: 13))
                         }
-                        Text("搜索")
+                        Text("全网搜索")
                             .font(.system(size: 13, weight: .semibold, design: .rounded))
                     }
                     .padding(.horizontal, 14)
@@ -2785,6 +3404,46 @@ struct SearchDownloadView: View {
                 .buttonStyle(.plain)
                 .disabled(vm.isSearching || vm.keyword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
+            
+            // 平台分类切换胶囊
+            platformFilterBar
+        }
+    }
+    
+    // 平台切换胶囊栏
+    private var platformFilterBar: some View {
+        HStack(spacing: 6) {
+            ForEach(MusicSourcePlatform.allCases) { platform in
+                let isSelected = vm.selectedPlatform == platform
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        vm.selectedPlatform = platform
+                    }
+                }) {
+                    HStack(spacing: 5) {
+                        if platform != .all {
+                            Circle()
+                                .fill(platform.badgeColor)
+                                .frame(width: 6, height: 6)
+                        }
+                        Text(platform.rawValue)
+                            .font(.system(size: 11, weight: isSelected ? .bold : .medium, design: .rounded))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(isSelected ? Color.white.opacity(0.20) : Color.white.opacity(0.06))
+                    )
+                    .foregroundColor(isSelected ? .white : .white.opacity(0.70))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .stroke(isSelected ? platform.badgeColor.opacity(0.8) : Color.white.opacity(0.08), lineWidth: 1)
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
         }
     }
     
@@ -2796,23 +3455,23 @@ struct SearchDownloadView: View {
                 Spacer()
                 ProgressView()
                     .scaleEffect(1.1)
-                Text("正在全网检索高品质音轨与 LRC 歌词...")
+                Text("正在全网四大平台并发检索高品质音轨与 LRC 歌词...")
                     .font(.system(size: 13, design: .rounded))
                     .foregroundColor(.white.opacity(0.70))
                 Spacer()
             }
-        } else if vm.results.isEmpty {
+        } else if vm.filteredResults.isEmpty {
             VStack(spacing: 10) {
                 Spacer()
                 Image(systemName: vm.hasSearched ? "music.slash" : "sparkles")
                     .font(.system(size: 36))
                     .foregroundColor(.white.opacity(0.30))
                 
-                Text(vm.errorMessage ?? (vm.hasSearched ? "未找到相关音乐" : "搜索并一键下载最高音质音频与同步歌词"))
+                Text(vm.errorMessage ?? (vm.hasSearched ? (vm.selectedPlatform == .all ? "未找到相关音乐" : "当前平台 [\(vm.selectedPlatform.rawValue)] 未找到结果，可切换至【全部】或其他平台") : "搜索并一键下载最高音质音频与同步歌词"))
                     .font(.system(size: 14, weight: .medium, design: .rounded))
                     .foregroundColor(.white.opacity(0.70))
                 
-                Text("优先下载 FLAC/320K 音轨，自动生成毫秒级同名 .lrc 文件")
+                Text("支持网易云、酷狗、酷我、QQ音乐四维多源聚合与跨平台无感自动换源")
                     .font(.system(size: 12, design: .rounded))
                     .foregroundColor(.white.opacity(0.40))
                 Spacer()
@@ -2820,7 +3479,7 @@ struct SearchDownloadView: View {
         } else {
             ScrollView {
                 LazyVStack(spacing: 4) {
-                    ForEach(vm.results) { item in
+                    ForEach(vm.filteredResults) { item in
                         trackRowView(item: item)
                     }
                 }
@@ -2834,11 +3493,9 @@ struct SearchDownloadView: View {
     private func trackRowView(item: SearchTrackItem) -> some View {
         let status = engine.activeDownloads[item.id] ?? .idle
         
-        return HStack(spacing: 10) {
-            Image(systemName: "music.note")
-                .font(.system(size: 14))
-                .foregroundColor(.white.opacity(0.50))
-                .frame(width: 20)
+        return HStack(spacing: 8) {
+            // 来源平台 Badge
+            platformBadge(source: item.source)
             
             VStack(alignment: .leading, spacing: 3) {
                 Text(item.title)
@@ -2885,6 +3542,17 @@ struct SearchDownloadView: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(Color.white.opacity(0.04))
         )
+    }
+    
+    // 平台彩色 Badge
+    private func platformBadge(source: MusicSourcePlatform) -> some View {
+        Text(source.badgeShortTitle)
+            .font(.system(size: 10, weight: .bold, design: .rounded))
+            .foregroundColor(.white)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 2)
+            .background(source.badgeColor.opacity(0.90))
+            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
     }
     
     // 音质 Badge
@@ -3011,6 +3679,7 @@ struct SearchDownloadView: View {
         }
     }
 }
+
 
 // 支持 ESC 键关闭的定制原生窗口
 class SearchWindow: NSWindow {
