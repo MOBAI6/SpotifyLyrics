@@ -2,6 +2,8 @@ import Cocoa
 import SwiftUI
 import CryptoKit
 import UserNotifications
+import AVFoundation
+import CoreMedia
 
 // MARK: - 1. 原生繁简转换与元数据清洗
 func toSimplified(_ s: String) -> String {
@@ -575,7 +577,7 @@ class LyricsEngine {
         }.resume()
     }
 
-    private func parseLRC(_ lrc: String, artist: String) -> [LyricLine] {
+    func parseLRC(_ lrc: String, artist: String = "") -> [LyricLine] {
         var result: [LyricLine] = []
         let lines = lrc.components(separatedBy: .newlines)
 
@@ -724,8 +726,16 @@ struct VisualEffectBackground: NSViewRepresentable {
     }
 }
 
+// MARK: - 7.5 双模播放源定义 (Spotify / 本地音乐)
+enum PlaybackSource: String {
+    case spotify
+    case local
+}
+
 // MARK: - 8. 视图状态中心 (以用户选择字号为核心，联动高度自适应展开行数)
 class LyricViewModel: ObservableObject {
+    static weak var shared: LyricViewModel?
+
     @Published var lyrics: [LyricLine] = []
     @Published var currentIndex: Int = -1
     @Published var placeholderTitle: String = "🎵 正在连接 Spotify..."
@@ -739,6 +749,7 @@ class LyricViewModel: ObservableObject {
     @Published var isGlassDisabled: Bool = false
     @Published var userSelectedFontSize: CGFloat = 30.0
     @Published var isAlwaysOnTop: Bool = false
+    @Published var playbackSource: PlaybackSource = .spotify
 
     var onToggleAlwaysOnTop: (() -> Void)?
     var onMinimizeWindow: (() -> Void)?
@@ -764,6 +775,7 @@ class LyricViewModel: ObservableObject {
     private var currentWindowHeight: CGFloat = 110
 
     init() {
+        Self.shared = self
         let savedTheme = UserDefaults.standard.string(forKey: "LyricTheme") ?? LyricTheme.appleMusic.rawValue
         self.theme = LyricTheme(rawValue: savedTheme) ?? .appleMusic
         self.isGlassDisabled = UserDefaults.standard.bool(forKey: "isGlassDisabled")
@@ -797,40 +809,141 @@ class LyricViewModel: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.consecutivePauseCount = 0
-            self?.pollSpotify(forceSync: true)
+            guard let self = self else { return }
+            if !LocalMusicPlayer.shared.isPlaying {
+                self.playbackSource = .spotify
+            }
+            self.consecutivePauseCount = 0
+            self.pollSpotify(forceSync: true)
         }
     }
 
     func onTick() {
-        let now = CACurrentMediaTime()
-        let interval: Double = isPlayingState ? 4.5 : 2.5
-        if now - lastPollTime >= interval {
-            lastPollTime = now
-            pollSpotify(forceSync: false)
-        } else if isPlayingState {
-            smoothedOffsetCorrection *= 0.90
-            let interpolatedPos = basePosition + (now - baseMediaTime) + smoothedOffsetCorrection
-            updateLyricsPosition(pos: interpolatedPos)
+        if playbackSource == .local {
+            let player = LocalMusicPlayer.shared
+            self.isPlayingState = player.isPlaying
+            if player.isPlaying {
+                updateLyricsPosition(pos: player.currentTime)
+            }
+        } else {
+            let now = CACurrentMediaTime()
+            let interval: Double = isPlayingState ? 4.5 : 2.5
+            if now - lastPollTime >= interval {
+                lastPollTime = now
+                pollSpotify(forceSync: false)
+            } else if isPlayingState {
+                smoothedOffsetCorrection *= 0.90
+                let interpolatedPos = basePosition + (now - baseMediaTime) + smoothedOffsetCorrection
+                updateLyricsPosition(pos: interpolatedPos)
+            }
         }
     }
 
     func seekToLine(time: Double) {
         guard time >= 0 else { return }
-        SpotifyController.shared.seek(to: time)
-        basePosition = time
-        baseMediaTime = CACurrentMediaTime()
-        smoothedOffsetCorrection = 0.0
-        updateLyricsPosition(pos: time)
+        if playbackSource == .local {
+            LocalMusicPlayer.shared.seek(to: time)
+            updateLyricsPosition(pos: time)
+        } else {
+            SpotifyController.shared.seek(to: time)
+            basePosition = time
+            baseMediaTime = CACurrentMediaTime()
+            smoothedOffsetCorrection = 0.0
+            updateLyricsPosition(pos: time)
+        }
     }
 
     func reloadCurrent() {
-        guard !currentTitle.isEmpty else { return }
-        lastTrackKey = ""
-        isShowingLyrics = false
-        placeholderTitle = "🔄 重新检索中..."
-        placeholderSubtitle = "\(currentTitle) - \(currentArtist)"
-        pollSpotify(forceSync: true, forceRefreshNetwork: true)
+        if playbackSource == .local {
+            if let cur = LocalMusicPlayer.shared.currentTrack {
+                playLocalTrack(cur)
+            }
+        } else {
+            guard !currentTitle.isEmpty else { return }
+            lastTrackKey = ""
+            isShowingLyrics = false
+            placeholderTitle = "🔄 重新检索中..."
+            placeholderSubtitle = "\(currentTitle) - \(currentArtist)"
+            pollSpotify(forceSync: true, forceRefreshNetwork: true)
+        }
+    }
+
+    func switchToSpotify() {
+        if playbackSource == .local {
+            LocalMusicPlayer.shared.pause()
+        }
+        self.playbackSource = .spotify
+        self.lastTrackKey = ""
+        self.isShowingLyrics = false
+        self.placeholderTitle = "🎵 正在连接 Spotify..."
+        self.placeholderSubtitle = "请在 Spotify 播放歌曲"
+        pollSpotify(forceSync: true)
+    }
+
+    func playLocalTrack(_ track: LocalTrackItem) {
+        self.playbackSource = .local
+        self.currentTitle = track.title
+        self.currentArtist = track.artist
+        self.isPlayingState = true
+        self.lastTrackKey = "LOCAL-\(track.artist)-\(track.title)"
+        self.lyrics = []
+        self.currentIndex = -1
+        self.isShowingLyrics = false
+        self.placeholderTitle = "🎵 \(track.title)"
+        self.placeholderSubtitle = "\(track.artist) · 加载本地歌词..."
+
+        let lrcURL = track.lrcURL ?? track.url.deletingPathExtension().appendingPathExtension("lrc")
+
+        // 步骤一：优先读取本地同名 .lrc 文件
+        if FileManager.default.fileExists(atPath: lrcURL.path),
+           let lrcContent = try? String(contentsOf: lrcURL, encoding: .utf8),
+           !lrcContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let lines = LyricsEngine.shared.parseLRC(lrcContent, artist: track.artist)
+            if !lines.isEmpty {
+                self.lyrics = lines
+                self.isShowingLyrics = true
+                self.updateLyricsPosition(pos: LocalMusicPlayer.shared.currentTime)
+                return
+            }
+        }
+
+        // 步骤二：若无本地歌词，自动无感触发全网检索拉取并写入本地 .lrc
+        self.placeholderSubtitle = "\(track.artist) · 正在联网匹配歌词..."
+        let durationMs = track.duration > 0 ? (track.duration * 1000.0) : 0.0
+        let currentToken = UUID()
+        self.requestToken = currentToken
+
+        LyricsEngine.shared.fetchLyrics(title: track.title, artist: track.artist, durationMs: durationMs) { [weak self] list in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                guard self.requestToken == currentToken else { return }
+
+                if let list = list, !list.isEmpty {
+                    self.lyrics = list
+                    self.isShowingLyrics = true
+                    self.updateLyricsPosition(pos: LocalMusicPlayer.shared.currentTime)
+
+                    // 将获取到的歌词写入同目录下的同名 .lrc
+                    var reconstructed = ""
+                    if !track.title.isEmpty { reconstructed += "[ti:\(track.title)]\n" }
+                    if !track.artist.isEmpty { reconstructed += "[ar:\(track.artist)]\n" }
+                    for l in list {
+                        let m = Int(l.time) / 60
+                        let s = l.time.truncatingRemainder(dividingBy: 60)
+                        reconstructed += String(format: "[%02d:%05.2f]%@\n", m, s, l.text)
+                    }
+                    do {
+                        try reconstructed.write(to: lrcURL, atomically: true, encoding: .utf8)
+                        LocalMusicLibrary.shared.markTrackHasLrc(trackId: track.id, lrcURL: lrcURL)
+                    } catch {
+                        print("写入本地 LRC 失败: \(error)")
+                    }
+                } else {
+                    self.placeholderTitle = "🎵 \(track.title)"
+                    self.placeholderSubtitle = "\(track.artist) (全网检索完毕，暂无匹配歌词)"
+                }
+            }
+        }
     }
 
     func updateDimensions(width: CGFloat, height: CGFloat) {
@@ -1172,21 +1285,39 @@ struct LyricFloatingView: View {
                     .fill(Color.white.opacity(0.30))
                     .frame(width: 3, height: 3)
 
-                Button(action: { SpotifyController.shared.previous() }) {
+                Button(action: {
+                    if vm.playbackSource == .local {
+                        LocalMusicPlayer.shared.previous()
+                    } else {
+                        SpotifyController.shared.previous()
+                    }
+                }) {
                     Image(systemName: "backward.fill")
                         .font(.system(size: 11))
                         .foregroundColor(.white.opacity(0.85))
                 }
                 .buttonStyle(.plain)
 
-                Button(action: { SpotifyController.shared.playPause() }) {
+                Button(action: {
+                    if vm.playbackSource == .local {
+                        LocalMusicPlayer.shared.togglePlayPause()
+                    } else {
+                        SpotifyController.shared.playPause()
+                    }
+                }) {
                     Image(systemName: vm.isPlayingState ? "pause.fill" : "play.fill")
                         .font(.system(size: 12))
                         .foregroundColor(.white)
                 }
                 .buttonStyle(.plain)
 
-                Button(action: { SpotifyController.shared.next() }) {
+                Button(action: {
+                    if vm.playbackSource == .local {
+                        LocalMusicPlayer.shared.next()
+                    } else {
+                        SpotifyController.shared.next()
+                    }
+                }) {
                     Image(systemName: "forward.fill")
                         .font(.system(size: 11))
                         .foregroundColor(.white.opacity(0.85))
@@ -1201,6 +1332,336 @@ struct LyricFloatingView: View {
         .frame(maxHeight: .infinity, alignment: .topTrailing)
         .padding(.top, 8)
         .transition(.opacity)
+    }
+}
+
+// MARK: - 10.5 本地音频引擎与本地曲库 (Local Music Player & Library)
+
+struct LocalTrackItem: Identifiable, Equatable {
+    let id: UUID
+    let url: URL
+    let title: String
+    let artist: String
+    let duration: Double // 单位：秒
+    var hasLrc: Bool
+    var lrcURL: URL?
+
+    var formattedDuration: String {
+        guard duration > 0, !duration.isNaN, !duration.isInfinite else { return "00:00" }
+        let total = Int(duration)
+        let m = total / 60
+        let s = total % 60
+        return String(format: "%02d:%02d", m, s)
+    }
+}
+
+class LocalMusicPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
+    static let shared = LocalMusicPlayer()
+
+    @Published var isPlaying: Bool = false
+    @Published var currentTrack: LocalTrackItem? = nil
+    @Published var currentTrackIndex: Int = -1
+    @Published var currentTime: Double = 0.0
+    @Published var duration: Double = 0.0
+    @Published var playlist: [LocalTrackItem] = []
+    @Published var isSingleLoop: Bool = false
+    @Published var volume: Float = 1.0 {
+        didSet {
+            audioPlayer?.volume = volume
+        }
+    }
+
+    private var audioPlayer: AVAudioPlayer?
+    private var progressTimer: Timer?
+
+    override init() {
+        super.init()
+    }
+
+    func playTrack(_ track: LocalTrackItem, in list: [LocalTrackItem]? = nil) {
+        if let list = list, !list.isEmpty {
+            self.playlist = list
+            if let idx = list.firstIndex(where: { $0.url == track.url }) {
+                self.currentTrackIndex = idx
+            } else {
+                self.currentTrackIndex = -1
+            }
+        } else if let idx = playlist.firstIndex(where: { $0.url == track.url }) {
+            self.currentTrackIndex = idx
+        }
+
+        do {
+            audioPlayer?.stop()
+            audioPlayer = try AVAudioPlayer(contentsOf: track.url)
+            audioPlayer?.delegate = self
+            audioPlayer?.volume = volume
+            audioPlayer?.prepareToPlay()
+            audioPlayer?.play()
+
+            self.currentTrack = track
+            self.isPlaying = true
+            self.currentTime = 0.0
+            self.duration = audioPlayer?.duration ?? track.duration
+
+            startProgressTimer()
+
+            DispatchQueue.main.async {
+                LyricViewModel.shared?.playLocalTrack(track)
+            }
+        } catch {
+            print("播放本地音频失败: \(error)")
+            showSystemBanner(title: "播放本地音频失败", informativeText: "无法播放 \(track.title): \(error.localizedDescription)")
+        }
+    }
+
+    func play() {
+        guard let ap = audioPlayer else {
+            if let track = currentTrack ?? playlist.first {
+                playTrack(track)
+            }
+            return
+        }
+        ap.play()
+        self.isPlaying = true
+        startProgressTimer()
+        LyricViewModel.shared?.isPlayingState = true
+    }
+
+    func pause() {
+        audioPlayer?.pause()
+        self.isPlaying = false
+        stopProgressTimer()
+        LyricViewModel.shared?.isPlayingState = false
+    }
+
+    func togglePlayPause() {
+        if isPlaying {
+            pause()
+        } else {
+            play()
+        }
+    }
+
+    func previous() {
+        guard !playlist.isEmpty else { return }
+        if currentTime > 3.0 {
+            seek(to: 0)
+            return
+        }
+        var nextIdx = currentTrackIndex - 1
+        if nextIdx < 0 {
+            nextIdx = playlist.count - 1
+        }
+        playTrack(playlist[nextIdx])
+    }
+
+    func next() {
+        guard !playlist.isEmpty else { return }
+        let nextIdx = (currentTrackIndex + 1) % playlist.count
+        playTrack(playlist[nextIdx])
+    }
+
+    func seek(to time: Double) {
+        guard let ap = audioPlayer else { return }
+        let target = max(0, min(time, ap.duration))
+        ap.currentTime = target
+        self.currentTime = target
+    }
+
+    private func startProgressTimer() {
+        stopProgressTimer()
+        let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self = self, let ap = self.audioPlayer else { return }
+            self.currentTime = ap.currentTime
+            if ap.duration > 0 {
+                self.duration = ap.duration
+            }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        self.progressTimer = t
+    }
+
+    private func stopProgressTimer() {
+        progressTimer?.invalidate()
+        progressTimer = nil
+    }
+
+    // AVAudioPlayerDelegate 回调：单曲/列表循环
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if self.isSingleLoop, let cur = self.currentTrack {
+                self.playTrack(cur)
+            } else {
+                self.next()
+            }
+        }
+    }
+}
+
+class LocalMusicLibrary: NSObject, ObservableObject {
+    static let shared = LocalMusicLibrary()
+
+    private let userDefaultsKey = "UserLocalMusicDirectory"
+
+    @Published var musicDirectoryURL: URL {
+        didSet {
+            UserDefaults.standard.set(musicDirectoryURL.path, forKey: userDefaultsKey)
+        }
+    }
+
+    @Published var tracks: [LocalTrackItem] = []
+    @Published var isScanning: Bool = false
+
+    var musicDirectoryPath: String {
+        musicDirectoryURL.path
+    }
+
+    var displayPath: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if musicDirectoryPath.hasPrefix(home) {
+            return musicDirectoryPath.replacingOccurrences(of: home, with: "~")
+        }
+        return musicDirectoryPath
+    }
+
+    override init() {
+        if let saved = UserDefaults.standard.string(forKey: userDefaultsKey), !saved.isEmpty {
+            self.musicDirectoryURL = URL(fileURLWithPath: saved)
+        } else if let downloadSaved = UserDefaults.standard.string(forKey: "UserDownloadDirectory"), !downloadSaved.isEmpty {
+            self.musicDirectoryURL = URL(fileURLWithPath: downloadSaved)
+        } else {
+            let defaultDir = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Downloads")
+                .appendingPathComponent("Music")
+            self.musicDirectoryURL = defaultDir
+        }
+        super.init()
+        ensureDirectoryExists()
+        scanTracks()
+    }
+
+    func ensureDirectoryExists() {
+        var isDir: ObjCBool = false
+        if !FileManager.default.fileExists(atPath: musicDirectoryURL.path, isDirectory: &isDir) || !isDir.boolValue {
+            try? FileManager.default.createDirectory(at: musicDirectoryURL, withIntermediateDirectories: true)
+        }
+    }
+
+    func selectDirectory(window: NSWindow? = nil, completion: ((URL?) -> Void)? = nil) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "选择音乐目录"
+        panel.message = "请选择本地音乐文件夹"
+
+        let handler: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            if response == .OK, let selectedURL = panel.url {
+                self?.musicDirectoryURL = selectedURL
+                self?.ensureDirectoryExists()
+                self?.scanTracks()
+                completion?(selectedURL)
+            } else {
+                completion?(nil)
+            }
+        }
+
+        if let win = window {
+            panel.beginSheetModal(for: win, completionHandler: handler)
+        } else {
+            panel.begin(completionHandler: handler)
+        }
+    }
+
+    func openInFinder() {
+        ensureDirectoryExists()
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: musicDirectoryURL.path)
+    }
+
+    func scanTracks() {
+        ensureDirectoryExists()
+        isScanning = true
+
+        let folderURL = self.musicDirectoryURL
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let fm = FileManager.default
+            guard let enumerator = fm.enumerator(at: folderURL, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey], options: [.skipsHiddenFiles, .skipsPackageDescendants]) else {
+                DispatchQueue.main.async { self.isScanning = false }
+                return
+            }
+
+            var items: [LocalTrackItem] = []
+            let supportedExts = Set(["mp3", "flac", "m4a", "wav", "aac"])
+
+            for case let fileURL as URL in enumerator {
+                let ext = fileURL.pathExtension.lowercased()
+                guard supportedExts.contains(ext) else { continue }
+
+                let baseName = fileURL.deletingPathExtension().lastPathComponent
+                var title = baseName
+                var artist = "未知歌手"
+
+                if baseName.contains(" - ") {
+                    let parts = baseName.components(separatedBy: " - ")
+                    if parts.count >= 2 {
+                        title = parts[0].trimmingCharacters(in: .whitespaces)
+                        artist = parts[1].trimmingCharacters(in: .whitespaces)
+                    }
+                }
+
+                let asset = AVURLAsset(url: fileURL)
+                let dur = CMTimeGetSeconds(asset.duration)
+                let finalDur = (dur.isNaN || dur.isInfinite || dur < 0) ? 0.0 : dur
+
+                for meta in asset.commonMetadata {
+                    if let key = meta.commonKey?.rawValue {
+                        let stringVal = meta.value as? String
+                        if key == "title", let v = stringVal, !v.trimmingCharacters(in: .whitespaces).isEmpty {
+                            title = v.trimmingCharacters(in: .whitespaces)
+                        } else if key == "artist", let v = stringVal, !v.trimmingCharacters(in: .whitespaces).isEmpty {
+                            artist = v.trimmingCharacters(in: .whitespaces)
+                        }
+                    }
+                }
+
+                let lrcURL = fileURL.deletingPathExtension().appendingPathExtension("lrc")
+                let hasLrc = fm.fileExists(atPath: lrcURL.path)
+
+                let item = LocalTrackItem(
+                    id: UUID(),
+                    url: fileURL,
+                    title: title,
+                    artist: artist,
+                    duration: finalDur,
+                    hasLrc: hasLrc,
+                    lrcURL: hasLrc ? lrcURL : nil
+                )
+                items.append(item)
+            }
+
+            items.sort { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+
+            DispatchQueue.main.async {
+                self.tracks = items
+                self.isScanning = false
+                if LocalMusicPlayer.shared.playlist.isEmpty && !items.isEmpty {
+                    LocalMusicPlayer.shared.playlist = items
+                }
+            }
+        }
+    }
+
+    func markTrackHasLrc(trackId: UUID, lrcURL: URL) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if let idx = self.tracks.firstIndex(where: { $0.id == trackId }) {
+                self.tracks[idx].hasLrc = true
+                self.tracks[idx].lrcURL = lrcURL
+            }
+        }
     }
 }
 
@@ -2214,6 +2675,464 @@ class SearchWindowManager: NSObject, NSWindowDelegate {
     }
 }
 
+// MARK: - 13. 本地音乐曲库界面与独立毛玻璃窗口管理器 (LocalMusicView & LocalMusicWindowManager)
+
+// 支持 ESC 键关闭的定制本地曲库原生毛玻璃窗口 (尺寸 600x520)
+class LocalMusicWindow: NSWindow {
+    override func cancelOperation(_ sender: Any?) {
+        self.orderOut(nil)
+    }
+    
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 { // ESC 键
+            self.orderOut(nil)
+            return
+        }
+        super.keyDown(with: event)
+    }
+}
+
+class LocalMusicWindowManager: NSObject, NSWindowDelegate {
+    static let shared = LocalMusicWindowManager()
+    
+    private(set) var currentWindow: NSWindow?
+    
+    func showWindow() {
+        if let win = currentWindow {
+            win.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        
+        let win = LocalMusicWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 520),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        win.title = "本地音乐曲库"
+        win.titleVisibility = .hidden
+        win.titlebarAppearsTransparent = true
+        win.isMovableByWindowBackground = true
+        win.isOpaque = false
+        win.backgroundColor = .clear
+        win.hasShadow = true
+        win.minSize = NSSize(width: 500, height: 420)
+        win.center()
+        win.delegate = self
+        
+        let hostingView = NSHostingView(rootView: LocalMusicView())
+        win.contentView = hostingView
+        
+        self.currentWindow = win
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    
+    func closeWindow() {
+        currentWindow?.orderOut(nil)
+    }
+    
+    func toggleWindow() {
+        if let win = currentWindow, win.isVisible {
+            win.orderOut(nil)
+        } else {
+            showWindow()
+        }
+    }
+    
+    func windowWillClose(_ notification: Notification) {
+        self.currentWindow = nil
+    }
+}
+
+struct LocalMusicView: View {
+    @ObservedObject private var library = LocalMusicLibrary.shared
+    @ObservedObject private var player = LocalMusicPlayer.shared
+    @State private var searchText: String = ""
+    @State private var selectedTrackId: UUID?
+
+    var filteredTracks: [LocalTrackItem] {
+        let query = searchText.trimmingCharacters(in: .whitespaces).lowercased()
+        if query.isEmpty {
+            return library.tracks
+        }
+        return library.tracks.filter {
+            $0.title.lowercased().contains(query) || $0.artist.lowercased().contains(query)
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            // 独立原生毛玻璃背板
+            VisualEffectBackground(material: .hudWindow, blendingMode: .behindWindow, state: .active)
+
+            VStack(spacing: 0) {
+                // 1. 顶部标题与路径控制区
+                headerView
+                    .padding(.horizontal, 18)
+                    .padding(.top, 16)
+                    .padding(.bottom, 10)
+
+                // 2. 搜索过滤栏
+                searchBar
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 10)
+
+                Divider().background(Color.white.opacity(0.12))
+
+                // 3. 曲目列表内容区
+                trackListView
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                Divider().background(Color.white.opacity(0.12))
+
+                // 4. 底部 Mini 播放控制栏
+                bottomPlayerBar
+            }
+        }
+        .frame(width: 600, height: 520)
+        .onExitCommand {
+            LocalMusicWindowManager.shared.closeWindow()
+        }
+    }
+
+    // 顶部标题与路径
+    private var headerView: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: "music.note.house.fill")
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundColor(Color(red: 0.35, green: 0.95, blue: 0.90))
+                Text("本地音乐曲库")
+                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                    .foregroundColor(.white)
+
+                Spacer()
+
+                Text("共 \(library.tracks.count) 首曲目")
+                    .font(.system(size: 11, design: .rounded))
+                    .foregroundColor(.white.opacity(0.55))
+
+                Text("ESC 退出")
+                    .font(.system(size: 11, design: .rounded))
+                    .foregroundColor(.white.opacity(0.35))
+            }
+
+            HStack(spacing: 8) {
+                HStack(spacing: 4) {
+                    Image(systemName: "folder.fill")
+                        .font(.system(size: 11))
+                        .foregroundColor(.yellow.opacity(0.85))
+                    Text(library.displayPath)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.80))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.08)))
+
+                Spacer()
+
+                Button(action: {
+                    library.selectDirectory { _ in }
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "folder.badge.gear")
+                        Text("更换目录")
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white.opacity(0.85))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.12)))
+                }
+                .buttonStyle(.plain)
+
+                Button(action: {
+                    library.openInFinder()
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.up.forward.app")
+                        Text("Finder")
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white.opacity(0.85))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.12)))
+                }
+                .buttonStyle(.plain)
+
+                Button(action: {
+                    library.scanTracks()
+                }) {
+                    Image(systemName: library.isScanning ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.white.opacity(0.85))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.12)))
+                }
+                .buttonStyle(.plain)
+                .help("重新扫描曲库")
+            }
+        }
+    }
+
+    // 搜索过滤栏
+    private var searchBar: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 12))
+                .foregroundColor(.white.opacity(0.50))
+
+            TextField("搜索曲目名或歌手...", text: $searchText)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12, design: .rounded))
+                .foregroundColor(.white)
+
+            if !searchText.isEmpty {
+                Button(action: { searchText = "" }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 11))
+                        .foregroundColor(.white.opacity(0.50))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.black.opacity(0.30))
+        )
+    }
+
+    // 曲目列表
+    private var trackListView: some View {
+        Group {
+            if library.isScanning && library.tracks.isEmpty {
+                VStack(spacing: 12) {
+                    ProgressView()
+                    Text("正在扫描本地曲库...")
+                        .font(.system(size: 13, design: .rounded))
+                        .foregroundColor(.white.opacity(0.60))
+                }
+            } else if filteredTracks.isEmpty {
+                VStack(spacing: 10) {
+                    Image(systemName: "music.note.slash")
+                        .font(.system(size: 32))
+                        .foregroundColor(.white.opacity(0.25))
+                    Text(library.tracks.isEmpty ? "当前目录下暂无音频文件 (.mp3, .flac, .m4a, .wav)" : "未找到匹配曲目")
+                        .font(.system(size: 13, design: .rounded))
+                        .foregroundColor(.white.opacity(0.50))
+                    if library.tracks.isEmpty {
+                        Button("从 Finder 导入或更换目录") {
+                            library.selectDirectory { _ in }
+                        }
+                        .font(.system(size: 12))
+                        .padding(.top, 4)
+                    }
+                }
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 2) {
+                        ForEach(Array(filteredTracks.enumerated()), id: \.element.id) { index, item in
+                            trackRowView(index: index, item: item)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                }
+            }
+        }
+    }
+
+    // 单行曲目项
+    private func trackRowView(index: Int, item: LocalTrackItem) -> some View {
+        let isCurrent = player.currentTrack?.url == item.url
+        let isSelected = selectedTrackId == item.id
+
+        return HStack(spacing: 10) {
+            // 播放指示器或序号
+            Group {
+                if isCurrent {
+                    Image(systemName: player.isPlaying ? "speaker.wave.3.fill" : "speaker.fill")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(Color(red: 0.35, green: 0.95, blue: 0.90))
+                } else {
+                    Text("\(index + 1)")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.35))
+                }
+            }
+            .frame(width: 22, alignment: .center)
+
+            // 歌曲与歌手
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.title)
+                    .font(.system(size: 13, weight: isCurrent ? .bold : .medium, design: .rounded))
+                    .foregroundColor(isCurrent ? Color(red: 0.35, green: 0.95, blue: 0.90) : .white)
+                    .lineLimit(1)
+
+                Text(item.artist)
+                    .font(.system(size: 11, design: .rounded))
+                    .foregroundColor(.white.opacity(0.50))
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            // LRC 标签
+            if item.hasLrc {
+                Text("LRC")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundColor(Color(red: 0.20, green: 0.85, blue: 0.55))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(
+                        Capsule()
+                            .fill(Color(red: 0.20, green: 0.85, blue: 0.55).opacity(0.18))
+                    )
+            } else {
+                Text("无歌词")
+                    .font(.system(size: 9, design: .rounded))
+                    .foregroundColor(.white.opacity(0.25))
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 2)
+            }
+
+            // 时长
+            Text(item.formattedDuration)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(.white.opacity(0.40))
+                .frame(width: 44, alignment: .trailing)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(isCurrent ? Color.white.opacity(0.12) : (isSelected ? Color.white.opacity(0.06) : Color.clear))
+        )
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) {
+            player.playTrack(item, in: filteredTracks)
+        }
+        .onTapGesture(count: 1) {
+            selectedTrackId = item.id
+        }
+    }
+
+    // 底部 Mini 播放栏
+    private var bottomPlayerBar: some View {
+        VStack(spacing: 6) {
+            // 进度条与时间
+            HStack(spacing: 8) {
+                Text(formatSeconds(player.currentTime))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.50))
+                    .frame(width: 36, alignment: .leading)
+
+                Slider(
+                    value: Binding<Double>(
+                        get: { player.currentTime },
+                        set: { newTime in
+                            player.seek(to: newTime)
+                        }
+                    ),
+                    in: 0...max(1.0, player.duration)
+                )
+                .accentColor(Color(red: 0.35, green: 0.95, blue: 0.90))
+
+                Text(formatSeconds(player.duration))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.50))
+                    .frame(width: 36, alignment: .trailing)
+            }
+
+            HStack {
+                // 左侧正在播放信息
+                HStack(spacing: 8) {
+                    Image(systemName: "music.note")
+                        .font(.system(size: 12))
+                        .foregroundColor(Color(red: 0.35, green: 0.95, blue: 0.90))
+
+                    if let cur = player.currentTrack {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(cur.title)
+                                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                                .foregroundColor(.white)
+                                .lineLimit(1)
+                            Text(cur.artist)
+                                .font(.system(size: 10, design: .rounded))
+                                .foregroundColor(.white.opacity(0.50))
+                                .lineLimit(1)
+                        }
+                        .frame(maxWidth: 180, alignment: .leading)
+                    } else {
+                        Text("未在播放本地曲目")
+                            .font(.system(size: 11, design: .rounded))
+                            .foregroundColor(.white.opacity(0.40))
+                    }
+                }
+
+                Spacer()
+
+                // 中间控制按钮
+                HStack(spacing: 16) {
+                    Button(action: { player.previous() }) {
+                        Image(systemName: "backward.fill")
+                            .font(.system(size: 13))
+                            .foregroundColor(.white.opacity(0.85))
+                    }
+                    .buttonStyle(.plain)
+
+                    Button(action: { player.togglePlayPause() }) {
+                        Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                            .font(.system(size: 26))
+                            .foregroundColor(Color(red: 0.35, green: 0.95, blue: 0.90))
+                    }
+                    .buttonStyle(.plain)
+
+                    Button(action: { player.next() }) {
+                        Image(systemName: "forward.fill")
+                            .font(.system(size: 13))
+                            .foregroundColor(.white.opacity(0.85))
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Spacer()
+
+                // 右侧循环模式切换
+                Button(action: {
+                    player.isSingleLoop.toggle()
+                }) {
+                    Image(systemName: player.isSingleLoop ? "repeat.1" : "repeat")
+                        .font(.system(size: 12))
+                        .foregroundColor(player.isSingleLoop ? Color(red: 0.35, green: 0.95, blue: 0.90) : .white.opacity(0.50))
+                }
+                .buttonStyle(.plain)
+                .help(player.isSingleLoop ? "当前：单曲循环" : "当前：列表循环")
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.black.opacity(0.25))
+    }
+
+    private func formatSeconds(_ sec: Double) -> String {
+        guard sec > 0, !sec.isNaN, !sec.isInfinite else { return "00:00" }
+        let total = Int(sec)
+        let m = total / 60
+        let s = total % 60
+        return String(format: "%02d:%02d", m, s)
+    }
+}
+
 // MARK: - 10. 主应用控制器与状态栏菜单
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: NSWindow!
@@ -2306,7 +3225,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.contentView = hv
         window.makeKeyAndOrderFront(nil)
 
-        // 注册局部/全局快捷键监听：⌘F 打开搜索窗口，⌘S 下载当前播放曲目
+        // 注册局部/全局快捷键监听：⌘F 打开搜索窗口，⌘S 下载当前曲目，⌘L 打开本地曲库，⌘O 选择音乐目录
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             if event.modifierFlags.contains(.command) {
                 let key = event.charactersIgnoringModifiers?.lowercased()
@@ -2315,6 +3234,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     return nil
                 } else if key == "s" {
                     self?.downloadCurrentTrackAction()
+                    return nil
+                } else if key == "l" {
+                    self?.openLocalMusicWindow()
+                    return nil
+                } else if key == "o" {
+                    self?.chooseLocalMusicFolder()
                     return nil
                 }
             }
@@ -2370,7 +3295,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         updateMenu()
     }
 
-    private func updateMenu() {
+    func updateMenu() {
         statusItem.menu = buildAppMenu()
         hostingView?.menu = buildAppMenu()
     }
@@ -2382,6 +3307,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         titleItem.isEnabled = false
         menu.addItem(titleItem)
         menu.addItem(NSMenuItem.separator())
+
+        // 🎵 本地音乐曲库入口 (⌘L)
+        menu.addItem(NSMenuItem(title: "🎵 本地音乐曲库... (⌘L)", action: #selector(openLocalMusicWindow), keyEquivalent: "l"))
 
         // 🔍 音乐搜索与双轨下载入口 (⌘F)
         menu.addItem(NSMenuItem(title: "🔍 搜索并下载音乐... (⌘F)", action: #selector(openSearchWindow), keyEquivalent: "f"))
@@ -2444,10 +3372,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(glassItem)
 
         menu.addItem(NSMenuItem.separator())
-        // 📁 音乐存储目录管理
-        let dirTitle = "📁 存储目录: \(DownloadConfig.shared.displayPath)"
+        // 📁 本地音乐与下载目录管理
+        let localDirTitle = "📁 本地曲库目录: \(LocalMusicLibrary.shared.displayPath)"
+        menu.addItem(NSMenuItem(title: localDirTitle, action: #selector(openLocalMusicFolderInFinder), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "📂 选择本地音乐目录... (⌘O)", action: #selector(chooseLocalMusicFolder), keyEquivalent: "o"))
+
+        let dirTitle = "📁 音乐下载目录: \(DownloadConfig.shared.displayPath)"
         menu.addItem(NSMenuItem(title: dirTitle, action: #selector(openDownloadFolder), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "⚙️ 更改音乐保存目录...", action: #selector(changeDownloadFolder), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "⚙️ 更改音乐下载目录...", action: #selector(changeDownloadFolder), keyEquivalent: ""))
+
+        if vm.playbackSource == .local {
+            menu.addItem(NSMenuItem(title: "📻 切换回 Spotify 模式", action: #selector(switchToSpotifyAction), keyEquivalent: ""))
+        }
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "🔄 强制重新拉取当前歌词", action: #selector(reloadLyrics), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "🗑 清除本地歌词缓存 (已缓存 \(count) 首)", action: #selector(clearLyricsCache), keyEquivalent: ""))
@@ -2552,6 +3488,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc func openSearchWindow() {
         SearchWindowManager.shared.showWindow()
+    }
+
+    @objc func openLocalMusicWindow() {
+        LocalMusicWindowManager.shared.toggleWindow()
+    }
+
+    @objc func chooseLocalMusicFolder() {
+        LocalMusicLibrary.shared.selectDirectory(window: window) { [weak self] _ in
+            self?.updateMenu()
+        }
+    }
+
+    @objc func openLocalMusicFolderInFinder() {
+        LocalMusicLibrary.shared.openInFinder()
+    }
+
+    @objc func switchToSpotifyAction() {
+        vm.switchToSpotify()
+        updateMenu()
     }
 
     @objc func downloadCurrentTrackAction() {

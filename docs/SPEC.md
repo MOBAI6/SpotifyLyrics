@@ -1,6 +1,6 @@
-# SpotifyLyrics 音乐搜索、高品质音频与歌词同步下载规格规范 (SPEC)
+# SpotifyLyrics 本地音乐播放、曲库管理与本地歌词展示规格规范 (SPEC)
 
-本文档详细定义 SpotifyLyrics 音乐搜索检索、最高音质音频与同名 LRC 歌词双轨下载、自定义下载目录管理的完整业务泳道与技术架构时序。
+本文档定义 SpotifyLyrics 支持**本地音乐文件夹选择**、**本地音频播放引擎 (AVFoundation)**、**本地同名 LRC 歌词自动关联与展示**以及**本地曲库交互窗口**的完整业务泳道与技术实现时序。
 
 ---
 
@@ -9,43 +9,51 @@
 ```mermaid
 flowchart TD
     subgraph User["👤 用户交互 (User)"]
-        A1["入口 1: 快捷键 ⌘S / 右键菜单下载当前歌曲"]
-        A2["入口 2: 点击 '搜索并下载音乐' (⌘F) 打开搜索面板"]
-        A3["输入关键词 (歌名/歌手) 并点击搜索"]
-        A4["在搜索结果列表中点击某首歌曲的 '下载' 按钮"]
-        A5["入口 3: 点击 '更改下载目录...' 调起目录选择器"]
-        A6["收到完成通知并在 Finder 音乐目录中查收音频与歌词"]
+        A1["入口 1: 快捷键 ⌘O / 菜单选择本地音乐文件夹"]
+        A2["入口 2: 快捷键 ⌘L 唤出本地音乐播放列表"]
+        A3["在本地曲库列表中选择曲目双击播放"]
+        A4["在悬停条或桌面歌词上切歌、暂停或点击歌词跳转进度"]
+        A5["查看桌面悬浮歌词实时高亮同步滚动"]
     end
 
-    subgraph UI["🖥 界面表现层 (SwiftUI & NSWindow)"]
-        B1["状态栏 / 右键菜单展示当前歌曲下载项"]
-        B2["轻量级独立搜索窗口 (SearchDownloadWindow)"]
-        B3["展示检索结果列表 (歌名、歌手、专辑、时长、高音质标签)"]
-        B4["系统原生 NSOpenPanel 目录选取器"]
-        B5["实时下载状态动效 (⏳ 下载音频中... / 抓取歌词中...)"]
+    subgraph UI["🖥 界面表现层 (SwiftUI & Windows)"]
+        B1["系统原生 NSOpenPanel 文件夹选择器"]
+        B2["轻量毛玻璃本地音乐列表窗口 (LocalMusicWindow)"]
+        B3["展示音频文件清单、时长、[LRC] 本地歌词标签与播放指示器"]
+        B4["桌面歌词悬浮窗 (LyricFloatingView)"]
+        B5["悬停控制条与菜单栏动态同步本地播放状态"]
     end
 
-    subgraph Controller["🧠 状态与配置中枢 (LyricViewModel & DownloadConfig)"]
-        C1["解析当前歌曲元数据 (Title, Artist, Duration)"]
-        C2["管理下载目录路径 (默认: ~/Downloads/Music，支持 UserDefaults 持久化)"]
-        C3["管理搜索状态、候选列表与下载任务状态映射"]
+    subgraph LocalLibrary["📂 本地曲库中枢 (LocalMusicLibrary)"]
+        C1["扫描指定目录下的音频文件 (.mp3, .flac, .m4a, .wav)"]
+        C2["解析音频 ID3 元数据与文件名 (<歌名> - <歌手>)"]
+        C3["检测并绑定同目录下同名 .lrc 歌词文件"]
+        C4["管理当前曲库播放列表与持久化选定文件夹"]
     end
 
-    subgraph Engine["⚙️ 双轨检索与下载引擎 (SongDownloadEngine)"]
-        D1["音频检索：查询开放音源并锁定最高音质 (优先 FLAC / 320Kbps)"]
-        D2["歌词检索：调用 LyricsEngine 抓取最佳同步 LRC 歌词文本"]
-        D3["双轨流式落盘：安全清洗文件名，写入 <目录>/<歌名 - 歌手>.mp3 与 .lrc"]
-        D4["广播 macOS 原生系统通知并高亮唤起 Finder"]
+    subgraph AudioEngine["🎵 本地播放引擎 (LocalMusicPlayer)"]
+        D1["基于 AVFoundation 构建音频流播放控制器"]
+        D2["状态管理：播放/暂停/上一首/下一首/Seek/单曲循环/列表循环"]
+        D3["高精度时钟 (250ms) 派发 currentTime 与 duration"]
     end
 
-    A1 --> B1 --> C1 --> D1
-    A2 --> B2
-    A3 --> B2 --> C3 --> D1
-    B2 --> B3 --> A4 --> D1
-    A5 --> B4 --> C2
-    D1 --> D3
-    C1 --> D2 --> D3
-    D3 --> D4 --> A6
+    subgraph LyricSync["🧠 歌词同步中枢 (LyricViewModel)"]
+        E1["双模感知：当前为 Spotify 模式还是 Local 本地模式"]
+        E2["优先读取本地同名 .lrc 文件并解析为时间戳行数组"]
+        E3["若无本地歌词，自动无感触发全网检索拉取并写入本地"]
+        E4["驱动 GPU 阻尼平移，点击歌词实时回拨本地音频进度"]
+    end
+
+    A1 --> B1 --> C1
+    A2 --> B2 --> C3
+    C1 --> C2 --> C3 --> B3
+    A3 --> D1
+    D1 --> D2 --> D3
+    D3 --> E1
+    C3 --> E2 --> E4 --> B4
+    E2 -- "无本地 LRC" --> E3 --> E2
+    A4 --> D2
+    E4 --> A5
 ```
 
 ---
@@ -56,82 +64,70 @@ flowchart TD
 sequenceDiagram
     autonumber
     actor User as 👤 用户
-    participant View as 🖥 搜索面板 / 浮窗菜单
-    participant VM as 🧠 LyricViewModel & Config
-    participant Engine as ⚙️ SongDownloadEngine
-    participant Netease as 🌐 开放音频解析源 (Netease API)
-    participant FS as 💾 本地文件系统 (Music Directory)
-    participant MacSystem as 🔔 macOS 系统 (Notification & Finder)
+    participant View as 🖥 列表窗口 / 桌面歌词
+    participant Library as 📂 LocalMusicLibrary
+    participant Player as 🎵 LocalMusicPlayer (AVFoundation)
+    participant VM as 🧠 LyricViewModel
+    participant FS as 💾 本地文件系统 (.mp3 & .lrc)
 
-    alt 场景 A：更改下载目录
-        User->>View: 点击“更改音乐下载目录...”
-        View->>MacSystem: 调起 NSOpenPanel (canChooseDirectories = true)
-        MacSystem-->>View: 用户选取新目录 URL
-        View->>VM: setDownloadDirectory(url)
-        VM->>FS: 校验并确保目录存在 (createDirectoryIfNotExist)
-        VM-->>View: 更新菜单与设置回显
-    else 场景 B：搜索并下载音乐
-        User->>View: 唤出搜索面板 (⌘F)，输入关键词回车
-        View->>Engine: searchTracks(keyword)
-        Engine->>Netease: 请求检索候选歌曲列表 (GET /cloudsearch)
-        Netease-->>Engine: 返回候选结果 (Title, Artist, Album, Duration, Privileges)
-        Engine-->>View: 渲染结果列表 (展示 FLAC/320K 最佳音质标识)
-        User->>View: 点击目标曲目后的“⬇️ 下载”
-        View->>Engine: startDownload(track, customDir)
-    else 场景 C：一键下载当前正在播放的曲目
-        User->>View: 按下 ⌘S 或点击“下载当前歌曲”
-        View->>Engine: startDownload(currentTrack, customDir)
-    end
+    User->>View: 按下 ⌘O 或点击“选择本地音乐文件夹...”
+    View->>Library: chooseMusicFolder()
+    Library->>FS: 调起 NSOpenPanel 选取文件夹
+    FS-->>Library: 返回 folderURL (持久化到 UserDefaults)
+    Library->>FS: 扫描目录下的 .mp3 / .flac / .m4a
+    Library->>FS: 检查同目录是否存在同名 .lrc 文件
+    Library-->>View: 刷新本地曲库清单 (展示曲目与 LRC 状态)
+
+    User->>View: 在列表窗口双击曲目 (或按 ⌘L 后播放)
+    View->>Player: playTrack(track)
+    Player->>FS: 加载音频文件并启动播放
+    Player->>VM: 切换当前播放源为 .local (传递 Track 标识)
 
     rect rgb(240, 248, 255)
-    Note over Engine, Netease: 步骤一：并发双轨请求 (最高音质音频 + 同步歌词)
-    par 音频最高码率探测与直链获取
-        Engine->>Netease: 请求播放链接 (level=lossless/exhigh, br=320000)
-        Netease-->>Engine: 返回 high_quality_url (FLAC 或 320k MP3)
-        Engine->>FS: URLSession.downloadTask 写入 <Dir>/<歌名 - 歌手>.<ext>
-    and 歌词抓取与格式化
-        Engine->>Netease: 拉取完整高精度 LRC 时间戳歌词
-        Netease-->>Engine: 返回 lrc_text
-        Engine->>FS: 格式化并写入 <Dir>/<歌名 - 歌手>.lrc
+    Note over VM, FS: 步骤一：本地歌词优先加载与同步
+    alt 本地存在同名 .lrc 文件
+        VM->>FS: 读取本地 <歌名 - 歌手>.lrc 文本
+        FS-->>VM: 返回歌词原始文本
+        VM->>VM: parseLRC 解析为时间戳歌词数组
+    else 本地不存在 .lrc 文件
+        VM->>VM: 自动触发后台全网歌词检索
+        VM->>FS: 将获取到的歌词写入同目录下 <歌名 - 歌手>.lrc
     end
     end
 
-    FS-->>Engine: 音频与歌词双文件落盘完成
-    Engine->>MacSystem: 发送系统横幅通知 (“已下载: 歌名 - 歌手 (包含音频与歌词)”)
-    Engine->>MacSystem: NSWorkspace.activateFileViewerSelecting([audioURL, lrcURL])
-    Engine-->>VM: 更新任务状态为 .completed
-    VM-->>View: 界面与搜索结果高亮已下载标识
+    loop 播放周期 (每 250ms 高精度驱动)
+        Player->>VM: 派发 currentTime (秒)
+        VM->>VM: 毫秒级对齐当前高亮歌词行 (currentIndex)
+        VM-->>View: 驱动桌面悬浮歌词 GPU 平滑滚动
+    end
+
+    User->>View: 点击某一行歌词 (seekToLine)
+    View->>Player: seek(to: targetTime)
+    Player->>Player: 音频瞬间跳转至指定时间点继续播放
 ```
 
 ---
 
-## 三、 详细技术方案与规格细节
+## 三、 详细技术实施方案
 
-### 1. 下载目录管理规范
-- **默认路径**：`~/Downloads/Music/`（自动创建）；
-- **持久化 Key**：`UserDefaults.standard.string(forKey: "UserDownloadDirectory")`；
-- **目录校验**：每次启动或修改时自动检查目录是否存在并具备写权限，不存在则自动执行 `createDirectory(at:withIntermediateDirectories:true)`；
-- **菜单交互**：
-  - `📁 当前保存目录: ~/Downloads/Music`（可点击在 Finder 中打开）；
-  - `⚙️ 更改音乐保存目录...`（调起原生文件夹选择器）。
+### 1. 本地播放引擎 (`LocalMusicPlayer`)
+- **音频核心**：采用 macOS 原生 `AVAudioPlayer` / `AVPlayer`；
+- **格式支持**：原生解码 `.mp3`、`.flac`、`.m4a`、`.wav`、`.aac`；
+- **状态流转**：`isPlaying`、`currentTime`、`duration`、`currentTrackIndex`、循环模式（列表循环/单曲循环）；
+- **悬停控制条联动**：当处于本地播放状态时，悬停控制胶囊上的 `⏮ ⏯ ⏭` 与双击单行折叠直接接管本地播放器。
 
-### 2. 最高音质检索与落盘格式
-- **音质探测策略**：
-  - 检索参数严格优先匹配 `level=lossless`（无损 FLAC）与 `level=exhigh`（320kbps 极高 MP3）；
-  - 若解析得到的内容类型为 `audio/flac` 或文件直链后缀为 `.flac`，则自动保存为标准的 `.flac` 扩展名；
-  - 若为 MP3 则保存为 `.mp3` 扩展名，绝不进行降采样有损压缩。
-- **文件名规范化**：
-  - 清洗特殊保留字符（`:`、`/`、`\`、`?`、`*`、`"`、`<`、`>`、`|`）；
-  - 统一格式：`<安全歌曲名> - <安全歌手名>.<ext>`。
+### 2. 本地曲库与歌词自动对齐 (`LocalMusicLibrary`)
+- **默认文件夹**：初始自动指向此前下载目录 `~/Downloads/Music`（用户无需重新配置，刚刚下载好的音乐即刻列出可播）；
+- **本地同名歌词对齐规则**：
+  - 音频路径：`/path/to/Music/晴天 - 周杰伦.mp3`
+  - 自动寻找：`/path/to/Music/晴天 - 周杰伦.lrc`
+  - 若存在直接读取，0 网络依赖，纯离线秒开；
+  - 若缺失，自动后台无感调用 `LyricsEngine` 拉取并保存同名 `.lrc` 文件到同目录下。
 
-### 3. 同名 LRC 歌词同步落盘
-- 在写入音频文件的同一目录下，同时写入同名歌词文件 `<安全歌曲名> - <安全歌手名>.lrc`；
-- 采用 UTF-8 编码，包含 `[ti:]`、`[ar:]`、`[al:]` 以及毫秒级滚动时间戳，能够直接被各类车载播放器、本地播放器（如 IINA、VLC、Foobar2000）完美自动识别加载。
-
-### 4. 独立原生搜索窗口 (Search & Download Window)
-- **外观与尺寸**：宽 580px、高 480px 的毛玻璃沉浸式悬浮窗口，按 `ESC` 或关闭按钮可退出；
-- **组件结构**：
-  - **顶部搜索栏**：输入框自动对齐焦点，支持回车直接触发搜索；
-  - **中间列表区**：展示搜索到的前 15~20 首结果，每行展示歌曲名、歌手、专辑、时长、品质标签（如 `320K`、`FLAC`）以及下载操作按钮；
-  - **操作状态**：点击后按钮切换为旋转进度圈（`Downloading`），完成后变为绿色对勾（`✓ 已完成`）；
-  - **底部状态条**：实时显示当前存储目录，并提供一键更改目录与打开文件夹链接。
+### 3. 本地曲库管理窗口 (`LocalMusicWindow`)
+- **交互规范**：
+  - 快捷键 **`⌘L`** 呼出/隐藏；
+  - 尺寸 600 × 520 毛玻璃沉浸设计，支持 `ESC` 退出；
+  - 支持即时关键词搜索过滤曲库；
+  - 列表项支持双击播放，标记 `[LRC]` 标识；
+  - 底部集成播放控制栏（进度条拖拽、上一首、播放/暂停、下一首、音量控制）。
