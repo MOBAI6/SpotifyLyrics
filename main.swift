@@ -759,10 +759,12 @@ class LyricViewModel: ObservableObject {
     private var lastTrackKey: String = ""
     private var currentTitle: String = ""
     private var currentArtist: String = ""
+    private var currentDuration: Double = 0.0
     private var requestToken: UUID = UUID()
 
     var currentTrackTitle: String { currentTitle }
     var currentTrackArtist: String { currentArtist }
+    var currentTrackDurationSeconds: Double { currentDuration }
 
     private var basePosition: Double = 0
     private var baseMediaTime: Double = 0
@@ -1039,6 +1041,7 @@ class LyricViewModel: ObservableObject {
                     self.lastTrackKey = trackKey
                     self.currentTitle = state.title
                     self.currentArtist = state.artist
+                    self.currentDuration = state.durMs / 1000.0
                     self.lyrics = []
                     self.currentIndex = -1
                     self.isShowingLyrics = false
@@ -1787,6 +1790,228 @@ struct SearchTrackItem: Identifiable, Equatable {
     }
 }
 
+// MARK: - 12.1 三维置信度评分与歌手白名单匹配器 (MultiFactorScorer)
+struct MultiFactorScorer {
+    // 负面噪音词表 (强力惩罚过滤)
+    static let negativeKeywords: [String] = [
+        "翻唱", "cover", "伴奏", "inst", "instrumental",
+        "dj版", "dj", "remix", "纯音乐", "钢琴版", "吉他版"
+    ]
+    
+    // 清洗歌手名，去除括号、feat、ft、with、特殊标点，转简体与小写
+    static func normalizeArtist(_ raw: String) -> String {
+        var s = toSimplified(raw).lowercased()
+        let patterns = [
+            "\\(.*?\\)",
+            "\\[.*?\\]",
+            "（.*?）",
+            "【.*?】",
+            "\\s*-\\s*.*",
+            "\\b(feat\\.|ft\\.|with)\\b.*"
+        ]
+        for p in patterns {
+            if let regex = try? NSRegularExpression(pattern: p, options: [.caseInsensitive]) {
+                s = regex.stringByReplacingMatches(in: s, options: [], range: NSRange(location: 0, length: (s as NSString).length), withTemplate: "")
+            }
+        }
+        let removeChars = CharacterSet(charactersIn: ",/&、|·•-_.()'\"[]")
+        let parts = s.components(separatedBy: removeChars)
+        return parts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    
+    // 清洗曲名，转简体与小写
+    static func normalizeTitle(_ raw: String) -> String {
+        let clean = cleanTrackTitle(raw)
+        return toSimplified(clean).lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    
+    // 提取子歌手清单 (支持多歌手逗号、/、&、;)
+    static func extractSubArtists(_ raw: String) -> [String] {
+        let seps = CharacterSet(charactersIn: ",/&、|;")
+        let subRaw = raw.components(separatedBy: seps)
+        var list: [String] = []
+        for s in subRaw {
+            let norm = normalizeArtist(s)
+            if !norm.isEmpty {
+                list.append(norm)
+            }
+        }
+        return list
+    }
+    
+    // 歌手一票否决与得分计算 (满分 50 分，不匹配返回 -999.0)
+    static func computeArtistScore(candArtist: String, targetArtist: String) -> Double {
+        let normTarget = normalizeArtist(targetArtist)
+        let normCand = normalizeArtist(candArtist)
+        
+        guard !normTarget.isEmpty, !normCand.isEmpty else {
+            return 0.0
+        }
+        
+        // 排除“翻唱/cover”潜伏在歌手名中的情况 (如“周杰伦翻唱”或“网络翻唱”)
+        let candLower = candArtist.lowercased()
+        let targetLower = targetArtist.lowercased()
+        if (candLower.contains("翻唱") || candLower.contains("cover")) &&
+            (!targetLower.contains("翻唱") && !targetLower.contains("cover")) {
+            return -999.0 // 一票否决
+        }
+        
+        if normCand == normTarget {
+            return 50.0
+        }
+        
+        let targetSubs = extractSubArtists(targetArtist)
+        let candSubs = extractSubArtists(candArtist)
+        
+        var isIncluded = false
+        // 1. 整串包含判定 (如 "周杰伦, 阿信" 包含 "周杰伦")
+        if normCand.contains(normTarget) {
+            isIncluded = true
+        } else if normTarget.contains(normCand) && normCand.count >= 2 {
+            isIncluded = true
+        } else {
+            // 2. 子歌手分词交叉判定
+            for t in targetSubs {
+                guard t.count >= 2 else { continue }
+                for c in candSubs {
+                    guard c.count >= 2 else { continue }
+                    if c == t || c.contains(t) || t.contains(c) {
+                        isIncluded = true
+                        break
+                    }
+                }
+                if isIncluded { break }
+            }
+        }
+        
+        // 白名单一票否决制：非目标歌手直接剔除
+        if !isIncluded {
+            return -999.0
+        }
+        
+        return 50.0
+    }
+    
+    // 歌名匹配与负面标签过滤 (满分 30 分)
+    static func computeTitleScore(candTitle: String, candArtist: String, candAlbum: String, targetTitle: String, targetArtist: String) -> Double {
+        let normTarget = normalizeTitle(targetTitle)
+        let normCand = normalizeTitle(candTitle)
+        
+        var score: Double = 0.0
+        if normCand == normTarget {
+            score = 30.0
+        } else if normCand.contains(normTarget) || normTarget.contains(normCand) {
+            score = 20.0
+        } else {
+            score = 5.0
+        }
+        
+        // 负面词过滤：对包含 ['翻唱', 'cover', '伴奏', 'inst', 'instrumental', 'dj版', 'remix', '纯音乐', '钢琴版'] 等词汇强力惩罚扣分
+        let targetFull = (targetTitle + " " + targetArtist).lowercased()
+        let candFull = (candTitle + " " + candArtist + " " + candAlbum).lowercased()
+        
+        for kw in negativeKeywords {
+            let kwSimp = toSimplified(kw).lowercased()
+            if !targetFull.contains(kwSimp) && candFull.contains(kwSimp) {
+                score -= 30.0
+            }
+        }
+        
+        return score
+    }
+    
+    // 时长逼近评分 (满分 20 分)
+    static func computeDurationScore(candDuration: Double, targetDuration: Double) -> Double {
+        guard targetDuration > 15.0 else {
+            return candDuration >= 60.0 ? 10.0 : -30.0
+        }
+        
+        let diff = abs(candDuration - targetDuration)
+        if diff <= 3.0 {
+            return 20.0
+        } else if diff <= 5.0 {
+            return 15.0 // 偏差 <= 5s 加分
+        } else if diff <= 8.0 {
+            return 10.0
+        } else if diff > 25.0 {
+            return -30.0 // 偏差 > 25s 扣分
+        } else {
+            return max(0.0, 10.0 - (diff - 8.0) * 0.8)
+        }
+    }
+    
+    // 综合置信度评分计算
+    static func scoreTrack(candidate: SearchTrackItem, targetTitle: String, targetArtist: String, targetDuration: Double) -> Double {
+        let aScore = computeArtistScore(candArtist: candidate.artist, targetArtist: targetArtist)
+        if aScore <= -900.0 {
+            return -999.0 // 歌手一票否决
+        }
+        
+        let tScore = computeTitleScore(candTitle: candidate.title, candArtist: candidate.artist, candAlbum: candidate.album, targetTitle: targetTitle, targetArtist: targetArtist)
+        let dScore = computeDurationScore(candDuration: candidate.durationSeconds, targetDuration: targetDuration)
+        
+        return aScore + tScore + dScore
+    }
+    
+    // 候选曲目过滤并按高置信度从高到低排序
+    static func rankCandidates(candidates: [SearchTrackItem], targetTitle: String, targetArtist: String, targetDuration: Double) -> [SearchTrackItem] {
+        var scored: [(item: SearchTrackItem, score: Double)] = []
+        
+        for c in candidates {
+            let s = scoreTrack(candidate: c, targetTitle: targetTitle, targetArtist: targetArtist, targetDuration: targetDuration)
+            if s > -900.0 {
+                scored.append((c, s))
+            }
+        }
+        
+        let sorted = scored.sorted { $0.score > $1.score }
+        
+        // 门槛过滤：优先取 >= 50 分的高置信度曲目
+        let highConf = sorted.filter { $0.score >= 50.0 }.map { $0.item }
+        if !highConf.isEmpty {
+            return highConf
+        }
+        
+        // 降级兜底：通过歌手白名单且总分 > 0 的有效备选
+        return sorted.filter { $0.score > 0 }.map { $0.item }
+    }
+}
+
+// MARK: - 12.2 防试听物理时长门禁 (AntiPreviewGate)
+struct AntiPreviewGate {
+    enum GateResult {
+        case pass(actualSeconds: Double)
+        case fail(reason: String, actualSeconds: Double)
+    }
+    
+    static func inspectAudio(at fileURL: URL, targetDuration: Double) -> GateResult {
+        let asset = AVURLAsset(url: fileURL)
+        let dur = CMTimeGetSeconds(asset.duration)
+        
+        // 防御 NaN、无穷大或异常值
+        guard !dur.isNaN, !dur.isInfinite, dur > 0 else {
+            return .fail(reason: "未能读取到有效音频音轨时长", actualSeconds: 0)
+        }
+        
+        // 门禁规则 1: 绝对下限 >= 60.0 秒 (彻底拦截 15s/30s 试听片段)
+        if dur < 60.0 {
+            return .fail(reason: "音频物理时长仅 \(String(format: "%.1f", dur))s (< 60s)，判定为 VIP 试听残卷", actualSeconds: dur)
+        }
+        
+        // 门禁规则 2: 若已知目标时长 (targetDuration > 30.0)，比对合理偏差
+        if targetDuration > 30.0 {
+            let diff = abs(dur - targetDuration)
+            let ratio = dur / targetDuration
+            // 相对容差: 误差 <= 18.0 秒，或时长比率在 85% ~ 115% 之间
+            if diff > 18.0 && (ratio < 0.85 || ratio > 1.15) {
+                return .fail(reason: "音频物理时长 \(String(format: "%.1f", dur))s 与目标时长 \(String(format: "%.1f", targetDuration))s 偏差过大 (差值: \(String(format: "%.1f", diff))s)", actualSeconds: dur)
+            }
+        }
+        
+        return .pass(actualSeconds: dur)
+    }
+}
+
 enum TrackDownloadStatus: Equatable {
     case idle
     case downloading(progressText: String)
@@ -1885,86 +2110,206 @@ class SongDownloadEngine: ObservableObject {
         }
     }
     
-    // 下载曲目 (最高音质音频 + 同步 LRC 歌词)
-    func downloadTrack(item: SearchTrackItem, completion: ((Bool, String) -> Void)? = nil) {
-        DownloadConfig.shared.ensureDirectoryExists()
-        let destDir = DownloadConfig.shared.downloadDirectoryURL
-        
-        DispatchQueue.main.async {
-            self.activeDownloads[item.id] = .downloading(progressText: "获取最高音质链接...")
-        }
-        
-        let safeTitle = DownloadConfig.cleanFileName(item.title)
-        let safeArtist = DownloadConfig.cleanFileName(item.artist)
-        let baseFileName = "\(safeTitle) - \(safeArtist)"
-        let lrcDestURL = destDir.appendingPathComponent("\(baseFileName).lrc")
-        
-        // 步骤 1: 请求播放直链 (通道 1 Meting 302 -> 通道 2 Paugram -> 通道 3 Meting 跟随下载)
-        fetchDirectAudioUrl(id: item.id) { [weak self] audioUrlStr, formatType in
-            guard let self = self else { return }
+    // MARK: - 单候选下载与物理时长门禁校验
+    private func downloadSingleCandidate(
+        candidate: SearchTrackItem,
+        targetTitle: String,
+        targetArtist: String,
+        targetDuration: Double,
+        uiTrackId: Int,
+        completion: @escaping (Bool, String) -> Void
+    ) {
+        fetchDirectAudioUrl(id: candidate.id) { [weak self] audioUrlStr, formatType in
+            guard let self = self else {
+                completion(false, "实例已释放")
+                return
+            }
             
-            if let audioUrlStr = audioUrlStr, let audioDownloadUrl = URL(string: audioUrlStr) {
-                DispatchQueue.main.async {
-                    self.activeDownloads[item.id] = .downloading(progressText: "正在下载音频与歌词...")
+            guard let audioUrlStr = audioUrlStr, let audioDownloadUrl = URL(string: audioUrlStr) else {
+                completion(false, "未能获取到音频直链")
+                return
+            }
+            
+            let workingTempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".tmp")
+            var req = URLRequest(url: audioDownloadUrl)
+            req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
+            req.timeoutInterval = 45.0
+            
+            let downloadTask = URLSession.shared.downloadTask(with: req) { tempURL, response, error in
+                guard let tempURL = tempURL, error == nil else {
+                    try? FileManager.default.removeItem(at: workingTempURL)
+                    completion(false, error?.localizedDescription ?? "下载失败")
+                    return
                 }
                 
-                let group = DispatchGroup()
-                var audioSuccess = false
-                var finalAudioURL: URL? = nil
-                
-                // 1. 下载音频
-                group.enter()
-                var req = URLRequest(url: audioDownloadUrl)
-                req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
-                req.timeoutInterval = 45.0
-                
-                let downloadTask = URLSession.shared.downloadTask(with: req) { tempURL, response, error in
-                    defer { group.leave() }
-                    guard let tempURL = tempURL, error == nil else { return }
-                    
-                    // 校验临时文件大小必须 > 100KB (防止下到 404 错误页或空文件)
-                    let fileSize = (try? FileManager.default.attributesOfItem(atPath: tempURL.path)[.size] as? Int64) ?? 0
-                    guard fileSize > 100 * 1024 else {
-                        return
+                do {
+                    if FileManager.default.fileExists(atPath: workingTempURL.path) {
+                        try FileManager.default.removeItem(at: workingTempURL)
                     }
+                    try FileManager.default.moveItem(at: tempURL, to: workingTempURL)
+                } catch {
+                    try? FileManager.default.removeItem(at: workingTempURL)
+                    completion(false, "临时文件移动失败")
+                    return
+                }
+                
+                // 1. 校验大小 > 100KB
+                let fileSize = (try? FileManager.default.attributesOfItem(atPath: workingTempURL.path)[.size] as? Int64) ?? 0
+                guard fileSize > 100 * 1024 else {
+                    try? FileManager.default.removeItem(at: workingTempURL)
+                    completion(false, "音频文件过小 (<100KB)，判定为无效内容")
+                    return
+                }
+                
+                // 2. 物理时长门禁检查
+                let effTargetDur = targetDuration > 0 ? targetDuration : candidate.durationSeconds
+                let gateResult = AntiPreviewGate.inspectAudio(at: workingTempURL, targetDuration: effTargetDur)
+                
+                switch gateResult {
+                case .fail(let reason, let actualSec):
+                    // 门禁拦截！立即删除临时文件
+                    try? FileManager.default.removeItem(at: workingTempURL)
+                    NSLog("[AntiPreviewGate] 拦截候选 id=\(candidate.id) (\(candidate.title) - \(candidate.artist)): \(reason)")
+                    completion(false, "防试听门禁拦截: \(reason) (\(String(format: "%.1f", actualSec))s)")
                     
-                    // 通过文件头魔数或 response 确定扩展名 (.mp3 或 .flac)
-                    let ext = self.detectAudioExtension(fileURL: tempURL, response: response, fallbackFormat: formatType)
+                case .pass(let actualSec):
+                    // 门禁通过！判定为真实完整音频！
+                    DownloadConfig.shared.ensureDirectoryExists()
+                    let destDir = DownloadConfig.shared.downloadDirectoryURL
+                    let ext = self.detectAudioExtension(fileURL: workingTempURL, response: response, fallbackFormat: formatType)
+                    let finalTitle = targetTitle.isEmpty ? candidate.title : targetTitle
+                    let finalArtist = targetArtist.isEmpty ? candidate.artist : targetArtist
+                    let safeTitle = DownloadConfig.cleanFileName(finalTitle)
+                    let safeArtist = DownloadConfig.cleanFileName(finalArtist)
+                    let baseFileName = "\(safeTitle) - \(safeArtist)"
                     let audioDestURL = destDir.appendingPathComponent("\(baseFileName).\(ext)")
+                    let lrcDestURL = destDir.appendingPathComponent("\(baseFileName).lrc")
                     
                     do {
                         if FileManager.default.fileExists(atPath: audioDestURL.path) {
                             try FileManager.default.removeItem(at: audioDestURL)
                         }
-                        try FileManager.default.moveItem(at: tempURL, to: audioDestURL)
-                        finalAudioURL = audioDestURL
-                        audioSuccess = true
+                        try FileManager.default.moveItem(at: workingTempURL, to: audioDestURL)
                     } catch {
-                        // 移动文件异常
+                        try? FileManager.default.removeItem(at: workingTempURL)
+                        completion(false, "目标文件写入失败: \(error.localizedDescription)")
+                        return
+                    }
+                    
+                    // 并发拉取并保存同名 LRC 歌词
+                    self.fetchAndSaveLrc(id: candidate.id, title: finalTitle, artist: finalArtist, album: candidate.album, destURL: lrcDestURL) { _ in
+                        DispatchQueue.main.async {
+                            self.activeDownloads[uiTrackId] = .completed
+                            self.notifyDownloadComplete(title: finalTitle, artist: finalArtist, audioURL: audioDestURL, lrcURL: lrcDestURL)
+                            completion(true, "下载完成 (已通过时长门禁: \(String(format: "%.1f", actualSec))s)")
+                        }
                     }
                 }
-                downloadTask.resume()
-                
-                // 2. 获取 LRC 歌词
-                group.enter()
-                self.fetchAndSaveLrc(id: item.id, title: item.title, artist: item.artist, album: item.album, destURL: lrcDestURL) { _ in
-                    group.leave()
-                }
-                
-                group.notify(queue: .main) {
-                    if audioSuccess, let audioURL = finalAudioURL {
-                        self.activeDownloads[item.id] = .completed
-                        self.notifyDownloadComplete(title: item.title, artist: item.artist, audioURL: audioURL, lrcURL: lrcDestURL)
-                        completion?(true, "下载完成")
-                    } else {
-                        // 音频直链下载未达标或失败，尝试使用本地 yt-dlp 兜底
-                        self.fallbackWithYtDlp(title: item.title, artist: item.artist, destDir: destDir, lrcDestURL: lrcDestURL, trackId: item.id, completion: completion)
+            }
+            downloadTask.resume()
+        }
+    }
+    
+    // MARK: - 候选队列换源轮询下载器
+    private func downloadCandidateQueue(
+        queue: [SearchTrackItem],
+        index: Int,
+        targetTitle: String,
+        targetArtist: String,
+        targetDuration: Double,
+        uiTrackId: Int,
+        completion: ((Bool, String) -> Void)?
+    ) {
+        if index >= queue.count {
+            // 队列所有候选源均尝试完毕，尝试本地 yt-dlp 兜底
+            let destDir = DownloadConfig.shared.downloadDirectoryURL
+            let safeTitle = DownloadConfig.cleanFileName(targetTitle)
+            let safeArtist = DownloadConfig.cleanFileName(targetArtist)
+            let baseFileName = "\(safeTitle) - \(safeArtist)"
+            let lrcDestURL = destDir.appendingPathComponent("\(baseFileName).lrc")
+            
+            fallbackWithYtDlp(title: targetTitle, artist: targetArtist, targetDuration: targetDuration, destDir: destDir, lrcDestURL: lrcDestURL, trackId: uiTrackId) { success, msg in
+                if !success {
+                    let failMsg = "所有公开音源均为试听片段（或受版权限制），已拦截保存残卷"
+                    DispatchQueue.main.async {
+                        self.activeDownloads[uiTrackId] = .failed(error: failMsg)
+                        completion?(false, failMsg)
                     }
+                } else {
+                    completion?(true, msg)
                 }
+            }
+            return
+        }
+        
+        let candidate = queue[index]
+        let currentStep = index + 1
+        let totalCount = queue.count
+        
+        DispatchQueue.main.async {
+            self.activeDownloads[uiTrackId] = .downloading(progressText: "正在尝试第 \(currentStep)/\(totalCount) 个音源 (\(candidate.qualityTag))...")
+        }
+        
+        downloadSingleCandidate(candidate: candidate, targetTitle: targetTitle, targetArtist: targetArtist, targetDuration: targetDuration, uiTrackId: uiTrackId) { [weak self] success, msg in
+            guard let self = self else { return }
+            if success {
+                completion?(true, msg)
             } else {
-                // 音频链接获取失败，预先保存歌词并尝试 yt-dlp 兜底
-                self.fetchAndSaveLrc(id: item.id, title: item.title, artist: item.artist, album: item.album, destURL: lrcDestURL) { _ in }
-                self.fallbackWithYtDlp(title: item.title, artist: item.artist, destDir: destDir, lrcDestURL: lrcDestURL, trackId: item.id, completion: completion)
+                // 当前源失败或被门禁拦截，自动尝试队列中下一个音源！
+                DispatchQueue.main.async {
+                    self.activeDownloads[uiTrackId] = .downloading(progressText: "音源 \(currentStep) 未通过门禁，正在换源重试...")
+                }
+                self.downloadCandidateQueue(queue: queue, index: index + 1, targetTitle: targetTitle, targetArtist: targetArtist, targetDuration: targetDuration, uiTrackId: uiTrackId, completion: completion)
+            }
+        }
+    }
+    
+    // 下载曲目 (最高音质音频 + 同步 LRC 歌词，支持试听自动换源)
+    func downloadTrack(item: SearchTrackItem, completion: ((Bool, String) -> Void)? = nil) {
+        DownloadConfig.shared.ensureDirectoryExists()
+        
+        DispatchQueue.main.async {
+            self.activeDownloads[item.id] = .downloading(progressText: "获取最高音质链接...")
+        }
+        
+        // 首先以当前 item 作为首选进行尝试
+        self.downloadSingleCandidate(candidate: item, targetTitle: item.title, targetArtist: item.artist, targetDuration: item.durationSeconds, uiTrackId: item.id) { [weak self] success, msg in
+            guard let self = self else { return }
+            if success {
+                completion?(true, msg)
+            } else {
+                // 当前 item 失败或未通过门禁（试听残卷），自动触发换源轮询！
+                DispatchQueue.main.async {
+                    self.activeDownloads[item.id] = .downloading(progressText: "原音源受限/试听，正在自动换源检索...")
+                }
+                self.searchTracks(query: "\(item.title) \(item.artist)") { [weak self] candidates in
+                    guard let self = self else { return }
+                    let others = candidates.filter { $0.id != item.id }
+                    let ranked = MultiFactorScorer.rankCandidates(candidates: others, targetTitle: item.title, targetArtist: item.artist, targetDuration: item.durationSeconds)
+                    
+                    if !ranked.isEmpty {
+                        self.downloadCandidateQueue(queue: ranked, index: 0, targetTitle: item.title, targetArtist: item.artist, targetDuration: item.durationSeconds, uiTrackId: item.id, completion: completion)
+                    } else {
+                        // 无其他候选，尝试 yt-dlp
+                        let destDir = DownloadConfig.shared.downloadDirectoryURL
+                        let safeTitle = DownloadConfig.cleanFileName(item.title)
+                        let safeArtist = DownloadConfig.cleanFileName(item.artist)
+                        let baseFileName = "\(safeTitle) - \(safeArtist)"
+                        let lrcDestURL = destDir.appendingPathComponent("\(baseFileName).lrc")
+                        
+                        self.fallbackWithYtDlp(title: item.title, artist: item.artist, targetDuration: item.durationSeconds, destDir: destDir, lrcDestURL: lrcDestURL, trackId: item.id) { ytSuccess, ytMsg in
+                            if !ytSuccess {
+                                let failMsg = "各接口均仅提供试听片段，已阻止保存残卷"
+                                DispatchQueue.main.async {
+                                    self.activeDownloads[item.id] = .failed(error: failMsg)
+                                    completion?(false, failMsg)
+                                }
+                            } else {
+                                completion?(true, ytMsg)
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2141,8 +2486,8 @@ class SongDownloadEngine: ObservableObject {
         }
     }
     
-    // yt-dlp 兜底下载
-    private func fallbackWithYtDlp(title: String, artist: String, destDir: URL, lrcDestURL: URL, trackId: Int, completion: ((Bool, String) -> Void)?) {
+    // yt-dlp 兜底下载 (带物理时长门禁)
+    private func fallbackWithYtDlp(title: String, artist: String, targetDuration: Double, destDir: URL, lrcDestURL: URL, trackId: Int, completion: ((Bool, String) -> Void)?) {
         guard let ytdlpPath = findYtDlpPath() else {
             DispatchQueue.main.async {
                 self.activeDownloads[trackId] = .failed(error: "开放音源受版权保护且未检测到本地 yt-dlp 兜底工具")
@@ -2159,6 +2504,7 @@ class SongDownloadEngine: ObservableObject {
             let safeTitle = DownloadConfig.cleanFileName(title)
             let safeArtist = DownloadConfig.cleanFileName(artist)
             let audioDestURL = destDir.appendingPathComponent("\(safeTitle) - \(safeArtist).mp3")
+            let ytTempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp3")
             
             let process = Process()
             process.executableURL = URL(fileURLWithPath: ytdlpPath)
@@ -2166,26 +2512,49 @@ class SongDownloadEngine: ObservableObject {
                 "-x",
                 "--audio-format", "mp3",
                 "--audio-quality", "0",
-                "-o", audioDestURL.path,
+                "-o", ytTempURL.path,
                 "ytsearch1:\(title) \(artist)"
             ]
             
             do {
                 try process.run()
                 process.waitUntilExit()
-                if process.terminationStatus == 0 && FileManager.default.fileExists(atPath: audioDestURL.path) {
-                    DispatchQueue.main.async {
-                        self.activeDownloads[trackId] = .completed
-                        self.notifyDownloadComplete(title: title, artist: artist, audioURL: audioDestURL, lrcURL: lrcDestURL)
-                        completion?(true, "yt-dlp 兜底下载完成")
+                
+                if process.terminationStatus == 0 && FileManager.default.fileExists(atPath: ytTempURL.path) {
+                    // yt-dlp 文件下载完成，执行 AntiPreviewGate 门禁校验
+                    let gateResult = AntiPreviewGate.inspectAudio(at: ytTempURL, targetDuration: targetDuration)
+                    switch gateResult {
+                    case .fail(let reason, _):
+                        try? FileManager.default.removeItem(at: ytTempURL)
+                        DispatchQueue.main.async {
+                            let errMsg = "yt-dlp 兜底音源未通过时长门禁: \(reason)"
+                            self.activeDownloads[trackId] = .failed(error: errMsg)
+                            completion?(false, errMsg)
+                        }
+                    case .pass(let actualSec):
+                        if FileManager.default.fileExists(atPath: audioDestURL.path) {
+                            try? FileManager.default.removeItem(at: audioDestURL)
+                        }
+                        try FileManager.default.moveItem(at: ytTempURL, to: audioDestURL)
+                        
+                        // 拉取歌词
+                        self.fetchAndSaveLrc(id: 0, title: title, artist: artist, album: "", destURL: lrcDestURL) { _ in
+                            DispatchQueue.main.async {
+                                self.activeDownloads[trackId] = .completed
+                                self.notifyDownloadComplete(title: title, artist: artist, audioURL: audioDestURL, lrcURL: lrcDestURL)
+                                completion?(true, "yt-dlp 兜底下载完成 (时长: \(String(format: "%.1f", actualSec))s)")
+                            }
+                        }
                     }
                 } else {
+                    try? FileManager.default.removeItem(at: ytTempURL)
                     DispatchQueue.main.async {
                         self.activeDownloads[trackId] = .failed(error: "yt-dlp 执行未成功")
                         completion?(false, "yt-dlp 执行未成功")
                     }
                 }
             } catch {
+                try? FileManager.default.removeItem(at: ytTempURL)
                 DispatchQueue.main.async {
                     self.activeDownloads[trackId] = .failed(error: error.localizedDescription)
                     completion?(false, error.localizedDescription)
@@ -2231,24 +2600,53 @@ class SongDownloadEngine: ObservableObject {
         }
     }
     
-    // 一键下载当前 Spotify 正在播放曲目
-    func downloadCurrentPlaying(title: String, artist: String, completion: ((Bool, String) -> Void)? = nil) {
-        searchTracks(query: "\(title) \(artist)") { [weak self] items in
+    // 一键下载当前 Spotify 正在播放曲目 (三维评分过滤与自动换源轮询)
+    func downloadCurrentPlaying(title: String, artist: String, targetDuration: Double = 0, completion: ((Bool, String) -> Void)? = nil) {
+        let cleanT = cleanTrackTitle(title)
+        let cleanA = cleanArtistName(artist)
+        let query = "\(cleanT) \(cleanA)"
+        
+        searchTracks(query: query) { [weak self] items in
             guard let self = self else { return }
-            if let best = items.first {
-                self.downloadTrack(item: best, completion: completion)
+            
+            if items.isEmpty {
+                self.searchTracks(query: "\(title) \(artist)") { [weak self] fallbackItems in
+                    guard let self = self else { return }
+                    self.processAndStartDownload(candidates: fallbackItems, targetTitle: title, targetArtist: artist, targetDuration: targetDuration, uiTrackId: 0, completion: completion)
+                }
             } else {
-                let dummy = SearchTrackItem(
-                    id: -1,
-                    title: title,
-                    artist: artist,
-                    album: "",
-                    durationSeconds: 0,
-                    qualityTag: "320K"
-                )
-                self.downloadTrack(item: dummy, completion: completion)
+                self.processAndStartDownload(candidates: items, targetTitle: title, targetArtist: artist, targetDuration: targetDuration, uiTrackId: 0, completion: completion)
             }
         }
+    }
+    
+    private func processAndStartDownload(candidates: [SearchTrackItem], targetTitle: String, targetArtist: String, targetDuration: Double, uiTrackId: Int, completion: ((Bool, String) -> Void)?) {
+        let ranked = MultiFactorScorer.rankCandidates(candidates: candidates, targetTitle: targetTitle, targetArtist: targetArtist, targetDuration: targetDuration)
+        
+        if ranked.isEmpty {
+            // 无高分候选通过歌手白名单，尝试 yt-dlp 兜底
+            let destDir = DownloadConfig.shared.downloadDirectoryURL
+            let safeTitle = DownloadConfig.cleanFileName(targetTitle)
+            let safeArtist = DownloadConfig.cleanFileName(targetArtist)
+            let baseFileName = "\(safeTitle) - \(safeArtist)"
+            let lrcDestURL = destDir.appendingPathComponent("\(baseFileName).lrc")
+            
+            self.fallbackWithYtDlp(title: targetTitle, artist: targetArtist, targetDuration: targetDuration, destDir: destDir, lrcDestURL: lrcDestURL, trackId: uiTrackId) { success, msg in
+                if !success {
+                    let failMsg = "未检索到匹配的完整正曲音源（候选歌手不符或均为试听）"
+                    DispatchQueue.main.async {
+                        self.activeDownloads[uiTrackId] = .failed(error: failMsg)
+                        completion?(false, failMsg)
+                    }
+                } else {
+                    completion?(true, msg)
+                }
+            }
+            return
+        }
+        
+        let effUiId = uiTrackId != 0 ? uiTrackId : (ranked.first?.id ?? 0)
+        self.downloadCandidateQueue(queue: ranked, index: 0, targetTitle: targetTitle, targetArtist: targetArtist, targetDuration: targetDuration, uiTrackId: effUiId, completion: completion)
     }
 }
 
@@ -3512,6 +3910,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func downloadCurrentTrackAction() {
         let title = vm.currentTrackTitle
         let artist = vm.currentTrackArtist
+        let duration = vm.currentTrackDurationSeconds
         guard !title.isEmpty else {
             showSystemBanner(title: "未检测到播放曲目", informativeText: "请先在 Spotify 中播放歌曲，或使用 ⌘F 搜索下载。")
             return
@@ -3519,7 +3918,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         
         showSystemBanner(title: "开始下载当前曲目", informativeText: "正在检索 \(title) - \(artist) 的最高音质音轨与歌词...")
         
-        SongDownloadEngine.shared.downloadCurrentPlaying(title: title, artist: artist) { success, msg in
+        SongDownloadEngine.shared.downloadCurrentPlaying(title: title, artist: artist, targetDuration: duration) { success, msg in
             if !success {
                 showSystemBanner(title: "下载未成功", informativeText: "\(title) - \(artist)\n提示: \(msg)")
             }
