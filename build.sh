@@ -40,6 +40,11 @@ cat << 'EOF' > "${BUNDLE_DIR}/Contents/Info.plist"
     <true/>
     <key>NSAppleEventsUsageDescription</key>
     <string>SpotifyLyrics 需要控制 Spotify 以同步歌词与控制播放进度。</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+    </dict>
 </dict>
 </plist>
 EOF

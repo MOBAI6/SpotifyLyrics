@@ -2752,96 +2752,97 @@ class SongDownloadEngine: ObservableObject {
             return
         }
         
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 4.5
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
-        
-        URLSession.shared.dataTask(with: request) { data, _, _ in
-            guard let data = data else {
-                completion(nil, nil)
-                return
-            }
+        func executeRequest(targetUrl: URL, isRetry: Bool) {
+            var request = URLRequest(url: targetUrl)
+            request.timeoutInterval = 4.5
+            request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
             
-            // 严密图片排查判定：过滤图片扩展名与各类封面/图片关键词
-            let isImageUrl: (String) -> Bool = { candidate in
-                let lower = candidate.lowercased()
-                let imgMarkers = [
-                    ".jpg", ".jpeg", ".png", ".webp", ".gif",
-                    "albumcover", "kwimg", "star/album", "/cover/", "picture", "/img/"
-                ]
-                return imgMarkers.contains { lower.contains($0) }
-            }
-            
-            // 音频特征判定：必须包含明确的音频流特征
-            let isAudioCandidate: (String) -> Bool = { candidate in
-                guard !isImageUrl(candidate) else { return false }
-                let lower = candidate.lowercased()
-                let audioMarkers = [
-                    "trackmedia", "bitrate", "format",
-                    ".flac", ".mp3", ".ogg", ".m4a", ".aac"
-                ]
-                return audioMarkers.contains { lower.contains($0) }
-            }
-            
-            var directAudioUrl: String?
-            
-            // 1. 若响应为标准 JSON 且根层或 data 层直接含有 url 字段，优先提取（强制阻断任何图片）
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                if let direct = json["url"] as? String, direct.hasPrefix("http"), !isImageUrl(direct) {
-                    directAudioUrl = direct
-                } else if let dict = json["data"] as? [String: Any],
-                          let direct = dict["url"] as? String,
-                          direct.hasPrefix("http"),
-                          !isImageUrl(direct) {
-                    directAudioUrl = direct
-                }
-            }
-            
-            // 2. 若未从 JSON url 字段直接取得有效音频直链，从 message/msg/全文字符串中深度扫描提取
-            if directAudioUrl == nil {
-                var messageStr: String?
-                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    messageStr = (json["message"] as? String) ?? (json["msg"] as? String) ?? (json["data"] as? String)
-                }
-                if messageStr == nil {
-                    messageStr = String(data: data, encoding: .utf8)
-                }
-                
-                guard let message = messageStr else {
-                    completion(nil, nil)
-                    return
-                }
-                
-                var candidates: [String] = []
-                let nsMessage = message as NSString
-                let fullRange = NSRange(location: 0, length: nsMessage.length)
-                
-                // 策略 A：若用户配置了自定义 extractRegex，提取匹配项并自动去除非必要尾随空白
-                let cleanUserRegex = rule.extractRegex.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !cleanUserRegex.isEmpty,
-                   let userRegex = try? NSRegularExpression(pattern: cleanUserRegex, options: [.caseInsensitive]) {
-                    let matches = userRegex.matches(in: message, options: [], range: fullRange)
-                    for m in matches {
-                        var targetRange = m.range(at: 0)
-                        if m.numberOfRanges > 1 && m.range(at: 1).location != NSNotFound {
-                            targetRange = m.range(at: 1)
-                        }
-                        if targetRange.location != NSNotFound && targetRange.location + targetRange.length <= nsMessage.length {
-                            let rawUrl = nsMessage.substring(with: targetRange).trimmingCharacters(in: .whitespacesAndNewlines)
-                            if rawUrl.hasPrefix("http") && !isImageUrl(rawUrl) {
-                                candidates.append(rawUrl)
-                            }
+            URLSession.shared.dataTask(with: request) { data, _, error in
+                if let nsError = error as NSError?, nsError.code == -1022 || nsError.code == NSURLErrorAppTransportSecurityRequiresSecureConnection {
+                    NSLog("[SongDownloadEngine] ⚠️ [ATS拦截-1022] fetchMasterAudioUrl 受到 macOS ATS 策略拦截 (URL: \(targetUrl.absoluteString)): \(nsError.localizedDescription)")
+                    if !isRetry, targetUrl.scheme?.lowercased() == "http",
+                       var comps = URLComponents(url: targetUrl, resolvingAgainstBaseURL: false) {
+                        comps.scheme = "https"
+                        if let httpsUrl = comps.url {
+                            NSLog("[SongDownloadEngine] 🔄 fetchMasterAudioUrl 智能尝试回退至 HTTPS 备用方案: \(httpsUrl.absoluteString)")
+                            executeRequest(targetUrl: httpsUrl, isRetry: true)
+                            return
                         }
                     }
                 }
                 
-                // 策略 B：优先提取紧随“音乐链接：”、“链接：”之后出现的 HTTP/HTTPS 链接
-                let labeledPattern = "(?:音乐链接[：:]|链接[：:])\\s*(https?://[^\\s\"'<>]+)"
-                if let labeledRegex = try? NSRegularExpression(pattern: labeledPattern, options: [.caseInsensitive]) {
-                    let matches = labeledRegex.matches(in: message, options: [], range: fullRange)
-                    for m in matches {
-                        if m.numberOfRanges > 1 && m.range(at: 1).location != NSNotFound {
-                            let targetRange = m.range(at: 1)
+                guard let data = data else {
+                    if let error = error {
+                        NSLog("[SongDownloadEngine] ⚠️ fetchMasterAudioUrl 网络请求失败: \(error.localizedDescription)")
+                    }
+                    completion(nil, nil)
+                    return
+                }
+                
+                // 严密图片排查判定：过滤图片扩展名与各类封面/图片关键词
+                let isImageUrl: (String) -> Bool = { candidate in
+                    let lower = candidate.lowercased()
+                    let imgMarkers = [
+                        ".jpg", ".jpeg", ".png", ".webp", ".gif",
+                        "albumcover", "kwimg", "star/album", "/cover/", "picture", "/img/"
+                    ]
+                    return imgMarkers.contains { lower.contains($0) }
+                }
+                
+                // 音频特征判定：必须包含明确的音频流特征
+                let isAudioCandidate: (String) -> Bool = { candidate in
+                    guard !isImageUrl(candidate) else { return false }
+                    let lower = candidate.lowercased()
+                    let audioMarkers = [
+                        "trackmedia", "bitrate", "format",
+                        ".flac", ".mp3", ".ogg", ".m4a", ".aac"
+                    ]
+                    return audioMarkers.contains { lower.contains($0) }
+                }
+                
+                var directAudioUrl: String?
+                
+                // 1. 若响应为标准 JSON 且根层或 data 层直接含有 url 字段，优先提取（强制阻断任何图片）
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    if let direct = json["url"] as? String, direct.hasPrefix("http"), !isImageUrl(direct) {
+                        directAudioUrl = direct
+                    } else if let dict = json["data"] as? [String: Any],
+                              let direct = dict["url"] as? String,
+                              direct.hasPrefix("http"),
+                              !isImageUrl(direct) {
+                        directAudioUrl = direct
+                    }
+                }
+                
+                // 2. 若未从 JSON url 字段直接取得有效音频直链，从 message/msg/全文字符串中深度扫描提取
+                if directAudioUrl == nil {
+                    var messageStr: String?
+                    if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                        messageStr = (json["message"] as? String) ?? (json["msg"] as? String) ?? (json["data"] as? String)
+                    }
+                    if messageStr == nil {
+                        messageStr = String(data: data, encoding: .utf8)
+                    }
+                    
+                    guard let message = messageStr else {
+                        completion(nil, nil)
+                        return
+                    }
+                    
+                    var candidates: [String] = []
+                    let nsMessage = message as NSString
+                    let fullRange = NSRange(location: 0, length: nsMessage.length)
+                    
+                    // 策略 A：若用户配置了自定义 extractRegex，提取匹配项并自动去除非必要尾随空白
+                    let cleanUserRegex = rule.extractRegex.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !cleanUserRegex.isEmpty,
+                       let userRegex = try? NSRegularExpression(pattern: cleanUserRegex, options: [.caseInsensitive]) {
+                        let matches = userRegex.matches(in: message, options: [], range: fullRange)
+                        for m in matches {
+                            var targetRange = m.range(at: 0)
+                            if m.numberOfRanges > 1 && m.range(at: 1).location != NSNotFound {
+                                targetRange = m.range(at: 1)
+                            }
                             if targetRange.location != NSNotFound && targetRange.location + targetRange.length <= nsMessage.length {
                                 let rawUrl = nsMessage.substring(with: targetRange).trimmingCharacters(in: .whitespacesAndNewlines)
                                 if rawUrl.hasPrefix("http") && !isImageUrl(rawUrl) {
@@ -2850,59 +2851,78 @@ class SongDownloadEngine: ObservableObject {
                             }
                         }
                     }
-                }
-                
-                // 策略 C：扫描全文所有出现的 HTTP/HTTPS 链接并进行图片清洗
-                let anyUrlPattern = "https?://[^\\s\"'<>\\]]+"
-                if let anyRegex = try? NSRegularExpression(pattern: anyUrlPattern, options: [.caseInsensitive]) {
-                    let matches = anyRegex.matches(in: message, options: [], range: fullRange)
-                    for m in matches {
-                        let targetRange = m.range(at: 0)
-                        if targetRange.location != NSNotFound && targetRange.location + targetRange.length <= nsMessage.length {
-                            let rawUrl = nsMessage.substring(with: targetRange).trimmingCharacters(in: .whitespacesAndNewlines)
-                            if rawUrl.hasPrefix("http") && !isImageUrl(rawUrl) {
-                                candidates.append(rawUrl)
+                    
+                    // 策略 B：优先提取紧随“音乐链接：”、“链接：”之后出现的 HTTP/HTTPS 链接
+                    let labeledPattern = "(?:音乐链接[：:]|链接[：:])\\s*(https?://[^\\s\"'<>]+)"
+                    if let labeledRegex = try? NSRegularExpression(pattern: labeledPattern, options: [.caseInsensitive]) {
+                        let matches = labeledRegex.matches(in: message, options: [], range: fullRange)
+                        for m in matches {
+                            if m.numberOfRanges > 1 && m.range(at: 1).location != NSNotFound {
+                                let targetRange = m.range(at: 1)
+                                if targetRange.location != NSNotFound && targetRange.location + targetRange.length <= nsMessage.length {
+                                    let rawUrl = nsMessage.substring(with: targetRange).trimmingCharacters(in: .whitespacesAndNewlines)
+                                    if rawUrl.hasPrefix("http") && !isImageUrl(rawUrl) {
+                                        candidates.append(rawUrl)
+                                    }
+                                }
                             }
                         }
                     }
+                    
+                    // 策略 C：扫描全文所有出现的 HTTP/HTTPS 链接并进行图片清洗
+                    let anyUrlPattern = "https?://[^\\s\"'<>\\]]+"
+                    if let anyRegex = try? NSRegularExpression(pattern: anyUrlPattern, options: [.caseInsensitive]) {
+                        let matches = anyRegex.matches(in: message, options: [], range: fullRange)
+                        for m in matches {
+                            let targetRange = m.range(at: 0)
+                            if targetRange.location != NSNotFound && targetRange.location + targetRange.length <= nsMessage.length {
+                                let rawUrl = nsMessage.substring(with: targetRange).trimmingCharacters(in: .whitespacesAndNewlines)
+                                if rawUrl.hasPrefix("http") && !isImageUrl(rawUrl) {
+                                    candidates.append(rawUrl)
+                                }
+                            }
+                        }
+                    }
+                    
+                    // 梯队优选：第一优先级为包含明确音频特征 (trackmedia, bitrate, format, .flac 等) 的直链，第二优先级为普通非图片直链
+                    if let audioUrl = candidates.first(where: { isAudioCandidate($0) }) {
+                        directAudioUrl = audioUrl
+                    } else if let validUrl = candidates.first {
+                        directAudioUrl = validUrl
+                    }
                 }
                 
-                // 梯队优选：第一优先级为包含明确音频特征 (trackmedia, bitrate, format, .flac 等) 的直链，第二优先级为普通非图片直链
-                if let audioUrl = candidates.first(where: { isAudioCandidate($0) }) {
-                    directAudioUrl = audioUrl
-                } else if let validUrl = candidates.first {
-                    directAudioUrl = validUrl
+                // 3. 对最终解析出的 directUrl 进行最终安全校验：绝不是图片，必须是有效音频
+                guard let directUrl = directAudioUrl,
+                      directUrl.hasPrefix("http"),
+                      !isImageUrl(directUrl),
+                      isAudioCandidate(directUrl) || (!preferFmt.isEmpty && !isImageUrl(directUrl)) else {
+                    NSLog("[SongDownloadEngine] ⚠️ 提取的直链未能通过最终音频安全校验 (非有效音频或为图片): \(directAudioUrl ?? "nil")")
+                    completion(nil, nil)
+                    return
                 }
-            }
-            
-            // 3. 对最终解析出的 directUrl 进行最终安全校验：绝不是图片，必须是有效音频
-            guard let directUrl = directAudioUrl,
-                  directUrl.hasPrefix("http"),
-                  !isImageUrl(directUrl),
-                  isAudioCandidate(directUrl) || (!preferFmt.isEmpty && !isImageUrl(directUrl)) else {
-                NSLog("[SongDownloadEngine] ⚠️ 提取的直链未能通过最终音频安全校验 (非有效音频或为图片): \(directAudioUrl ?? "nil")")
-                completion(nil, nil)
-                return
-            }
-            
-            let lower = directUrl.lowercased()
-            let format: String
-            if lower.contains(".flac") || lower.contains("format=flac") || lower.contains("flac") {
-                format = "flac"
-            } else if lower.contains(".ogg") || lower.contains("format=ogg") || lower.contains("ogg") {
-                format = "ogg"
-            } else if lower.contains(".mp3") || lower.contains("format=mp3") || lower.contains("mp3") {
-                format = "mp3"
-            } else if lower.contains(".m4a") || lower.contains("format=m4a") || lower.contains("m4a") {
-                format = "m4a"
-            } else if !preferFmt.isEmpty {
-                format = preferFmt
-            } else {
-                format = "mp3"
-            }
-            
-            completion(directUrl, format)
-        }.resume()
+                
+                let lower = directUrl.lowercased()
+                let format: String
+                if lower.contains(".flac") || lower.contains("format=flac") || lower.contains("flac") {
+                    format = "flac"
+                } else if lower.contains(".ogg") || lower.contains("format=ogg") || lower.contains("ogg") {
+                    format = "ogg"
+                } else if lower.contains(".mp3") || lower.contains("format=mp3") || lower.contains("mp3") {
+                    format = "mp3"
+                } else if lower.contains(".m4a") || lower.contains("format=m4a") || lower.contains("m4a") {
+                    format = "m4a"
+                } else if !preferFmt.isEmpty {
+                    format = preferFmt
+                } else {
+                    format = "mp3"
+                }
+                
+                completion(directUrl, format)
+            }.resume()
+        }
+        
+        executeRequest(targetUrl: url, isRetry: false)
     }
     
     // MARK: - 分布式直链解析分发器 (本地私有外挂音源通道 -> Custom API -> 平台内置分发)
@@ -3218,125 +3238,148 @@ class SongDownloadEngine: ObservableObject {
             let workingTempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".tmp")
             var effectiveTempURL = workingTempURL
             var effectiveFormat = formatType
-            var req = URLRequest(url: audioDownloadUrl)
-            req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
-            req.timeoutInterval = 45.0
             
-            let downloadTask = URLSession.shared.downloadTask(with: req) { tempURL, response, error in
-                guard let tempURL = tempURL, error == nil else {
-                    try? FileManager.default.removeItem(at: effectiveTempURL)
-                    completion(false, error?.localizedDescription ?? "下载失败")
-                    return
-                }
+            func performDownload(targetURL: URL, isRetry: Bool) {
+                var req = URLRequest(url: targetURL)
+                req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", forHTTPHeaderField: "User-Agent")
+                req.timeoutInterval = 45.0
                 
-                do {
-                    if FileManager.default.fileExists(atPath: effectiveTempURL.path) {
-                        try FileManager.default.removeItem(at: effectiveTempURL)
-                    }
-                    try FileManager.default.moveItem(at: tempURL, to: effectiveTempURL)
-                } catch {
-                    try? FileManager.default.removeItem(at: effectiveTempURL)
-                    completion(false, "临时文件移动失败")
-                    return
-                }
-                
-                // 1. 校验大小 > 100KB
-                let fileSize = (try? FileManager.default.attributesOfItem(atPath: effectiveTempURL.path)[.size] as? Int64) ?? 0
-                guard fileSize > 100 * 1024 else {
-                    try? FileManager.default.removeItem(at: effectiveTempURL)
-                    completion(false, "音频文件过小 (<100KB)，判定为无效内容")
-                    return
-                }
-                
-                // 2. 格式自适应与 OGG 转码处理 (FFmpeg Pipeline)
-                var isOgg = (effectiveFormat?.lowercased() == "ogg")
-                if !isOgg, let handle = try? FileHandle(forReadingFrom: effectiveTempURL) {
-                    let header = handle.readData(ofLength: 4)
-                    try? handle.close()
-                    if header.count >= 4 && header.starts(with: [0x4F, 0x67, 0x67, 0x53]) { // "OggS"
-                        isOgg = true
-                    }
-                }
-                
-                if isOgg {
-                    let ffmpegCandidates = [
-                        "/opt/homebrew/bin/ffmpeg",
-                        "/usr/local/bin/ffmpeg",
-                        "/usr/bin/ffmpeg"
-                    ]
-                    if let ffmpegPath = ffmpegCandidates.first(where: { FileManager.default.fileExists(atPath: $0) }) {
-                        let convertedTempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp3")
-                        let process = Process()
-                        process.executableURL = URL(fileURLWithPath: ffmpegPath)
-                        process.arguments = ["-y", "-i", effectiveTempURL.path, "-c:a", "libmp3lame", "-q:a", "0", convertedTempURL.path]
-                        process.standardOutput = Pipe()
-                        process.standardError = Pipe()
-                        
-                        do {
-                            try process.run()
-                            process.waitUntilExit()
-                            if process.terminationStatus == 0 && FileManager.default.fileExists(atPath: convertedTempURL.path) {
-                                try? FileManager.default.removeItem(at: effectiveTempURL)
-                                effectiveTempURL = convertedTempURL
-                                effectiveFormat = "mp3"
-                                NSLog("[SongDownloadEngine] 🔄 OGG -> MP3 转码成功: \(effectiveTempURL.path)")
-                            } else {
-                                try? FileManager.default.removeItem(at: convertedTempURL)
-                                NSLog("[SongDownloadEngine] ⚠️ ffmpeg 转码未正常退出 (code: \(process.terminationStatus))")
+                let downloadTask = URLSession.shared.downloadTask(with: req) { [weak self] tempURL, response, error in
+                    guard let self = self else { return }
+                    
+                    if let error = error {
+                        let nsError = error as NSError
+                        if nsError.code == -1022 || nsError.code == NSURLErrorAppTransportSecurityRequiresSecureConnection {
+                            NSLog("[SongDownloadEngine] ⚠️ [ATS拦截-1022] 下载受到 macOS ATS 策略拦截 (URL: \(targetURL.absoluteString)): \(nsError.localizedDescription)。请确认 Info.plist 中已正确配置 NSAppTransportSecurity")
+                            if !isRetry, targetURL.scheme?.lowercased() == "http",
+                               var comps = URLComponents(url: targetURL, resolvingAgainstBaseURL: false) {
+                                comps.scheme = "https"
+                                if let httpsURL = comps.url {
+                                    NSLog("[SongDownloadEngine] 🔄 [ATS自动回退] 尝试使用 https:// 重新下载: \(httpsURL.absoluteString)")
+                                    performDownload(targetURL: httpsURL, isRetry: true)
+                                    return
+                                }
                             }
-                        } catch {
-                            try? FileManager.default.removeItem(at: convertedTempURL)
-                            NSLog("[SongDownloadEngine] ⚠️ ffmpeg 执行异常: \(error)")
                         }
                     }
-                }
-                
-                // 3. 物理时长门禁检查
-                let effTargetDur = targetDuration > 0 ? targetDuration : candidate.durationSeconds
-                let gateResult = AntiPreviewGate.inspectAudio(at: effectiveTempURL, targetDuration: effTargetDur)
-                
-                switch gateResult {
-                case .fail(let reason, let actualSec):
-                    // 门禁拦截！立即删除临时文件
-                    try? FileManager.default.removeItem(at: effectiveTempURL)
-                    NSLog("[AntiPreviewGate] 拦截候选 id=\(candidate.id) [\(candidate.source.rawValue)] (\(candidate.title) - \(candidate.artist)): \(reason)")
-                    completion(false, "防试听门禁拦截: \(reason) (\(String(format: "%.1f", actualSec))s)")
                     
-                case .pass(let actualSec):
-                    // 门禁通过！判定为真实完整音频！
-                    DownloadConfig.shared.ensureDirectoryExists()
-                    let destDir = DownloadConfig.shared.downloadDirectoryURL
-                    let ext = self.detectAudioExtension(fileURL: effectiveTempURL, response: response, fallbackFormat: effectiveFormat)
-                    let finalTitle = targetTitle.isEmpty ? candidate.title : targetTitle
-                    let finalArtist = targetArtist.isEmpty ? candidate.artist : targetArtist
-                    let safeTitle = DownloadConfig.cleanFileName(finalTitle)
-                    let safeArtist = DownloadConfig.cleanFileName(finalArtist)
-                    let baseFileName = "\(safeTitle) - \(safeArtist)"
-                    let audioDestURL = destDir.appendingPathComponent("\(baseFileName).\(ext)")
-                    let lrcDestURL = destDir.appendingPathComponent("\(baseFileName).lrc")
-                    
-                    do {
-                        if FileManager.default.fileExists(atPath: audioDestURL.path) {
-                            try FileManager.default.removeItem(at: audioDestURL)
-                        }
-                        try FileManager.default.moveItem(at: effectiveTempURL, to: audioDestURL)
-                    } catch {
+                    guard let tempURL = tempURL, error == nil else {
                         try? FileManager.default.removeItem(at: effectiveTempURL)
-                        completion(false, "目标文件写入失败: \(error.localizedDescription)")
+                        completion(false, error?.localizedDescription ?? "下载失败")
                         return
                     }
                     
-                    // 并发拉取并保存同名 LRC 歌词
-                    self.fetchAndSaveLrc(candidate: candidate, title: finalTitle, artist: finalArtist, album: candidate.album, destURL: lrcDestURL) { _ in
-                        DispatchQueue.main.async {
-                            self.activeDownloads[uiTrackId] = .completed
-                            self.notifyDownloadComplete(title: finalTitle, artist: finalArtist, audioURL: audioDestURL, lrcURL: lrcDestURL)
-                            completion(true, "下载完成 (已通过时长门禁: \(String(format: "%.1f", actualSec))s)")
+                    do {
+                        if FileManager.default.fileExists(atPath: effectiveTempURL.path) {
+                            try FileManager.default.removeItem(at: effectiveTempURL)
+                        }
+                        try FileManager.default.moveItem(at: tempURL, to: effectiveTempURL)
+                    } catch {
+                        try? FileManager.default.removeItem(at: effectiveTempURL)
+                        completion(false, "临时文件移动失败")
+                        return
+                    }
+                    
+                    // 1. 校验大小 > 100KB
+                    let fileSize = (try? FileManager.default.attributesOfItem(atPath: effectiveTempURL.path)[.size] as? Int64) ?? 0
+                    guard fileSize > 100 * 1024 else {
+                        try? FileManager.default.removeItem(at: effectiveTempURL)
+                        completion(false, "音频文件过小 (<100KB)，判定为无效内容")
+                        return
+                    }
+                    
+                    // 2. 格式自适应与 OGG 转码处理 (FFmpeg Pipeline)
+                    var isOgg = (effectiveFormat?.lowercased() == "ogg")
+                    if !isOgg, let handle = try? FileHandle(forReadingFrom: effectiveTempURL) {
+                        let header = handle.readData(ofLength: 4)
+                        try? handle.close()
+                        if header.count >= 4 && header.starts(with: [0x4F, 0x67, 0x67, 0x53]) { // "OggS"
+                            isOgg = true
+                        }
+                    }
+                    
+                    if isOgg {
+                        let ffmpegCandidates = [
+                            "/opt/homebrew/bin/ffmpeg",
+                            "/usr/local/bin/ffmpeg",
+                            "/usr/bin/ffmpeg"
+                        ]
+                        if let ffmpegPath = ffmpegCandidates.first(where: { FileManager.default.fileExists(atPath: $0) }) {
+                            let convertedTempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp3")
+                            let process = Process()
+                            process.executableURL = URL(fileURLWithPath: ffmpegPath)
+                            process.arguments = ["-y", "-i", effectiveTempURL.path, "-c:a", "libmp3lame", "-q:a", "0", convertedTempURL.path]
+                            process.standardOutput = Pipe()
+                            process.standardError = Pipe()
+                            
+                            do {
+                                try process.run()
+                                process.waitUntilExit()
+                                if process.terminationStatus == 0 && FileManager.default.fileExists(atPath: convertedTempURL.path) {
+                                    try? FileManager.default.removeItem(at: effectiveTempURL)
+                                    effectiveTempURL = convertedTempURL
+                                    effectiveFormat = "mp3"
+                                    NSLog("[SongDownloadEngine] 🔄 OGG -> MP3 转码成功: \(effectiveTempURL.path)")
+                                } else {
+                                    try? FileManager.default.removeItem(at: convertedTempURL)
+                                    NSLog("[SongDownloadEngine] ⚠️ ffmpeg 转码未正常退出 (code: \(process.terminationStatus))")
+                                }
+                            } catch {
+                                try? FileManager.default.removeItem(at: convertedTempURL)
+                                NSLog("[SongDownloadEngine] ⚠️ ffmpeg 执行异常: \(error)")
+                            }
+                        }
+                    }
+                    
+                    // 3. 物理时长门禁检查
+                    let effTargetDur = targetDuration > 0 ? targetDuration : candidate.durationSeconds
+                    let gateResult = AntiPreviewGate.inspectAudio(at: effectiveTempURL, targetDuration: effTargetDur)
+                    
+                    switch gateResult {
+                    case .fail(let reason, let actualSec):
+                        // 门禁拦截！立即删除临时文件
+                        try? FileManager.default.removeItem(at: effectiveTempURL)
+                        NSLog("[AntiPreviewGate] 拦截候选 id=\(candidate.id) [\(candidate.source.rawValue)] (\(candidate.title) - \(candidate.artist)): \(reason)")
+                        completion(false, "防试听门禁拦截: \(reason) (\(String(format: "%.1f", actualSec))s)")
+                        
+                    case .pass(let actualSec):
+                        // 门禁通过！判定为真实完整音频！
+                        DownloadConfig.shared.ensureDirectoryExists()
+                        let destDir = DownloadConfig.shared.downloadDirectoryURL
+                        let ext = self.detectAudioExtension(fileURL: effectiveTempURL, response: response, fallbackFormat: effectiveFormat)
+                        let finalTitle = targetTitle.isEmpty ? candidate.title : targetTitle
+                        let finalArtist = targetArtist.isEmpty ? candidate.artist : targetArtist
+                        let safeTitle = DownloadConfig.cleanFileName(finalTitle)
+                        let safeArtist = DownloadConfig.cleanFileName(finalArtist)
+                        let baseFileName = "\(safeTitle) - \(safeArtist)"
+                        let audioDestURL = destDir.appendingPathComponent("\(baseFileName).\(ext)")
+                        let lrcDestURL = destDir.appendingPathComponent("\(baseFileName).lrc")
+                        
+                        do {
+                            if FileManager.default.fileExists(atPath: audioDestURL.path) {
+                                try FileManager.default.removeItem(at: audioDestURL)
+                            }
+                            try FileManager.default.moveItem(at: effectiveTempURL, to: audioDestURL)
+                        } catch {
+                            try? FileManager.default.removeItem(at: effectiveTempURL)
+                            completion(false, "目标文件写入失败: \(error.localizedDescription)")
+                            return
+                        }
+                        
+                        // 并发拉取并保存同名 LRC 歌词
+                        self.fetchAndSaveLrc(candidate: candidate, title: finalTitle, artist: finalArtist, album: candidate.album, destURL: lrcDestURL) { _ in
+                            DispatchQueue.main.async {
+                                self.activeDownloads[uiTrackId] = .completed
+                                self.notifyDownloadComplete(title: finalTitle, artist: finalArtist, audioURL: audioDestURL, lrcURL: lrcDestURL)
+                                completion(true, "下载完成 (已通过时长门禁: \(String(format: "%.1f", actualSec))s)")
+                            }
                         }
                     }
                 }
+                downloadTask.resume()
             }
-            downloadTask.resume()
+            
+            performDownload(targetURL: audioDownloadUrl, isRetry: false)
         }
     }
     
