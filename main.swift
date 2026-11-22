@@ -1720,15 +1720,32 @@ func showLegalDisclaimerAlert(window: NSWindow? = nil) {
 
 // MARK: - 12. 本地音乐曲库界面与独立毛玻璃窗口管理器 (LocalMusicView & LocalMusicWindowManager)
 
-// 支持 ESC 键关闭的定制本地曲库原生毛玻璃窗口 (尺寸 600x520)
+// 支持 ESC 键与 ⌘W 独立关闭的定制本地曲库原生毛玻璃窗口 (尺寸 600x520)
 class LocalMusicWindow: NSWindow {
+    override init(contentRect: NSRect, styleMask style: NSWindow.StyleMask, backing backingStoreType: NSWindow.BackingStoreType, defer flag: Bool) {
+        super.init(contentRect: contentRect, styleMask: style, backing: backingStoreType, defer: flag)
+        self.isReleasedWhenClosed = false
+    }
+
+    override func performClose(_ sender: Any?) {
+        self.orderOut(nil)
+        (NSApp.delegate as? AppDelegate)?.updateMenu()
+    }
+
     override func cancelOperation(_ sender: Any?) {
         self.orderOut(nil)
+        (NSApp.delegate as? AppDelegate)?.updateMenu()
     }
     
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { // ESC 键
             self.orderOut(nil)
+            (NSApp.delegate as? AppDelegate)?.updateMenu()
+            return
+        }
+        if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers?.lowercased() == "w" {
+            self.orderOut(nil)
+            (NSApp.delegate as? AppDelegate)?.updateMenu()
             return
         }
         super.keyDown(with: event)
@@ -1744,6 +1761,7 @@ class LocalMusicWindowManager: NSObject, NSWindowDelegate {
         if let win = currentWindow {
             win.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
+            (NSApp.delegate as? AppDelegate)?.updateMenu()
             return
         }
         
@@ -1753,6 +1771,7 @@ class LocalMusicWindowManager: NSObject, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
+        win.isReleasedWhenClosed = false
         win.title = "本地音乐曲库"
         win.titleVisibility = .hidden
         win.titlebarAppearsTransparent = true
@@ -1770,22 +1789,25 @@ class LocalMusicWindowManager: NSObject, NSWindowDelegate {
         self.currentWindow = win
         win.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        (NSApp.delegate as? AppDelegate)?.updateMenu()
     }
     
     func closeWindow() {
         currentWindow?.orderOut(nil)
+        (NSApp.delegate as? AppDelegate)?.updateMenu()
     }
     
     func toggleWindow() {
         if let win = currentWindow, win.isVisible {
             win.orderOut(nil)
+            (NSApp.delegate as? AppDelegate)?.updateMenu()
         } else {
             showWindow()
         }
     }
     
     func windowWillClose(_ notification: Notification) {
-        self.currentWindow = nil
+        (NSApp.delegate as? AppDelegate)?.updateMenu()
     }
 }
 
@@ -1843,7 +1865,7 @@ struct LocalMusicView: View {
     // 顶部标题与路径
     private var headerView: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
+            HStack(spacing: 8) {
                 Image(systemName: "music.note.house.fill")
                     .font(.system(size: 16, weight: .bold))
                     .foregroundColor(Color(red: 0.35, green: 0.95, blue: 0.90))
@@ -1857,9 +1879,23 @@ struct LocalMusicView: View {
                     .font(.system(size: 11, design: .rounded))
                     .foregroundColor(.white.opacity(0.55))
 
-                Text("ESC 退出")
-                    .font(.system(size: 11, design: .rounded))
-                    .foregroundColor(.white.opacity(0.35))
+                // 关闭按钮
+                Button(action: {
+                    LocalMusicWindowManager.shared.closeWindow()
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 12, weight: .medium))
+                        Text("关闭面板 (后台持续播放音乐与歌词)")
+                            .font(.system(size: 11, weight: .medium, design: .rounded))
+                    }
+                    .foregroundColor(.white.opacity(0.85))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.12)))
+                }
+                .buttonStyle(.plain)
+                .help("关闭曲库窗口 (ESC / ⌘W)，音乐与桌面歌词将在后台持续播放")
             }
 
             HStack(spacing: 8) {
@@ -2223,6 +2259,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
+        window.isReleasedWhenClosed = false
 
         window.delegate = self
         window.titleVisibility = .hidden
@@ -2268,16 +2305,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.contentView = hv
         window.makeKeyAndOrderFront(nil)
 
-        // 注册局部/全局快捷键监听：⌘L 打开本地曲库，⌘O 选择音乐目录
+        // 注册局部/全局快捷键监听：⌘L 打开本地曲库，⌘O 选择音乐目录，⌘W 窗口隔离精准关闭
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self else { return event }
             if event.modifierFlags.contains(.command) {
                 let key = event.charactersIgnoringModifiers?.lowercased()
                 if key == "l" {
-                    self?.openLocalMusicWindow()
+                    self.openLocalMusicWindow()
                     return nil
                 } else if key == "o" {
-                    self?.chooseLocalMusicFolder()
+                    self.chooseLocalMusicFolder()
                     return nil
+                } else if key == "w" {
+                    // 统一 ⌘W 处理逻辑：严格按当前活动窗口独立关闭，绝不连锁关闭！
+                    if let localWin = LocalMusicWindowManager.shared.currentWindow, localWin.isKeyWindow {
+                        LocalMusicWindowManager.shared.closeWindow()
+                        return nil
+                    } else if self.window.isKeyWindow {
+                        self.closeWindow()
+                        return nil
+                    }
+                    return nil // 消费掉 ⌘W，避免无焦或在其他视图下误触发
                 }
             }
             return event
@@ -2345,19 +2393,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(titleItem)
         menu.addItem(NSMenuItem.separator())
 
-        // 🎵 本地音乐曲库入口 (⌘L)
-        menu.addItem(NSMenuItem(title: "🎵 本地音乐曲库... (⌘L)", action: #selector(openLocalMusicWindow), keyEquivalent: "l"))
+        // 1. 桌面歌词窗口独立状态控制项 (移除全局 w 快捷键冲突)
+        let isLyricVisible = (window != nil && window.isVisible && !window.isMiniaturized)
+        let lyricTitle = isLyricVisible ? "✓ 桌面歌词窗口: 显示中 (点击隐藏)" : "桌面歌词窗口: 已隐藏 (点击恢复显示)"
+        menu.addItem(NSMenuItem(title: lyricTitle, action: #selector(toggleWindow), keyEquivalent: "h"))
+
+        // 2. 本地音乐曲库独立状态控制项 (⌘L)
+        let isLocalWinVisible = LocalMusicWindowManager.shared.currentWindow?.isVisible == true
+        let localTitle = isLocalWinVisible ? "✓ 本地音乐曲库: 已打开 (点击收起)" : "🎵 本地音乐曲库... (⌘L)"
+        menu.addItem(NSMenuItem(title: localTitle, action: #selector(openLocalMusicWindow), keyEquivalent: "l"))
+
         menu.addItem(NSMenuItem.separator())
-
-
-        let isShown = window != nil && window.isVisible && !window.isMiniaturized
-        if isShown {
-            menu.addItem(NSMenuItem(title: "关闭歌词窗口 (隐藏到后台)", action: #selector(closeWindow), keyEquivalent: "w"))
-        } else {
-            menu.addItem(NSMenuItem(title: "打开 / 恢复歌词窗口", action: #selector(toggleWindow), keyEquivalent: "w"))
-        }
-
-        menu.addItem(NSMenuItem(title: "显示 / 隐藏 桌面歌词", action: #selector(toggleWindow), keyEquivalent: "h"))
 
         let topTitle = isAlwaysOnTop ? "✓ 窗口永远置顶 (已开启)" : "开启窗口永远置顶模式"
         menu.addItem(NSMenuItem(title: topTitle, action: #selector(toggleAlwaysOnTop), keyEquivalent: "t"))
