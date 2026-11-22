@@ -915,7 +915,8 @@ class LyricViewModel: ObservableObject {
         let currentToken = UUID()
         self.requestToken = currentToken
 
-        LyricsEngine.shared.fetchLyrics(title: track.title, artist: track.artist, durationMs: durationMs) { [weak self] list in
+        let searchArtist = (track.artist == "未知歌手") ? "" : track.artist
+        LyricsEngine.shared.fetchLyrics(title: track.title, artist: searchArtist, durationMs: durationMs) { [weak self] list in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 guard self.requestToken == currentToken else { return }
@@ -939,6 +940,32 @@ class LyricViewModel: ObservableObject {
                         LocalMusicLibrary.shared.markTrackHasLrc(trackId: track.id, lrcURL: lrcURL)
                     } catch {
                         print("写入本地 LRC 失败: \(error)")
+                    }
+                } else if !searchArtist.isEmpty && track.title != searchArtist {
+                    // 智能降级尝试：部分文件名可能是 "歌手 - 歌名" 反转，尝试对调再搜一次
+                    LyricsEngine.shared.fetchLyrics(title: searchArtist, artist: track.title, durationMs: durationMs) { [weak self] fallbackList in
+                        DispatchQueue.main.async {
+                            guard let self = self else { return }
+                            guard self.requestToken == currentToken else { return }
+                            if let fallbackList = fallbackList, !fallbackList.isEmpty {
+                                self.lyrics = fallbackList
+                                self.isShowingLyrics = true
+                                self.updateLyricsPosition(pos: LocalMusicPlayer.shared.currentTime)
+                                var reconstructed = ""
+                                if !track.title.isEmpty { reconstructed += "[ti:\(track.title)]\n" }
+                                if !track.artist.isEmpty { reconstructed += "[ar:\(track.artist)]\n" }
+                                for l in fallbackList {
+                                    let m = Int(l.time) / 60
+                                    let s = l.time.truncatingRemainder(dividingBy: 60)
+                                    reconstructed += String(format: "[%02d:%05.2f]%@\n", m, s, l.text)
+                                }
+                                try? reconstructed.write(to: lrcURL, atomically: true, encoding: .utf8)
+                                LocalMusicLibrary.shared.markTrackHasLrc(trackId: track.id, lrcURL: lrcURL)
+                            } else {
+                                self.placeholderTitle = "🎵 \(track.title)"
+                                self.placeholderSubtitle = "\(track.artist) (全网检索完毕，暂无匹配歌词)"
+                            }
+                        }
                     }
                 } else {
                     self.placeholderTitle = "🎵 \(track.title)"
@@ -1343,18 +1370,181 @@ struct LyricFloatingView: View {
 struct LocalTrackItem: Identifiable, Equatable {
     let id: UUID
     let url: URL
-    let title: String
-    let artist: String
-    let duration: Double // 单位：秒
+    var title: String
+    var artist: String
+    var duration: Double // 单位：秒 (支持自适应探测与播放校准)
     var hasLrc: Bool
     var lrcURL: URL?
 
+    var fileExtension: String {
+        url.pathExtension.lowercased()
+    }
+
     var formattedDuration: String {
-        guard duration > 0, !duration.isNaN, !duration.isInfinite else { return "00:00" }
+        guard duration > 0, !duration.isNaN, !duration.isInfinite else { return "--:--" }
         let total = Int(duration)
         let m = total / 60
         let s = total % 60
         return String(format: "%02d:%02d", m, s)
+    }
+}
+
+// MARK: - FFmpeg 深度音频探测与全格式转码播放支持引擎
+class FFmpegAudioHelper {
+    static let shared = FFmpegAudioHelper()
+
+    private let ffmpegCandidatePaths = [
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/usr/bin/ffmpeg"
+    ]
+
+    private let ffprobeCandidatePaths = [
+        "/opt/homebrew/bin/ffprobe",
+        "/usr/local/bin/ffprobe",
+        "/usr/bin/ffprobe"
+    ]
+
+    var ffmpegPath: String? {
+        for path in ffmpegCandidatePaths {
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+        return nil
+    }
+
+    var ffprobePath: String? {
+        for path in ffprobeCandidatePaths {
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+        return nil
+    }
+
+    private var cacheDirectory: URL {
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        let dir = caches.appendingPathComponent("SpotifyLyrics/AudioCache", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    // 探测音频时长与标签 (当 AVURLAsset 无法解析特殊格式如 ogg/opus/ape/wma 时使用)
+    func probeMetadata(url: URL) -> (duration: Double, title: String?, artist: String?) {
+        guard let probe = ffprobePath else { return (0, nil, nil) }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: probe)
+        process.arguments = [
+            "-v", "error",
+            "-show_entries", "format=duration:format_tags=title,artist:stream_tags=title,artist",
+            "-of", "default=noprint_wrappers=1",
+            url.path
+        ]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard let output = String(data: data, encoding: .utf8) else {
+                return (0, nil, nil)
+            }
+
+            var dur: Double = 0
+            var title: String? = nil
+            var artist: String? = nil
+
+            let lines = output.components(separatedBy: .newlines)
+            for line in lines {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.hasPrefix("duration=") {
+                    let valStr = String(trimmed.dropFirst("duration=".count))
+                    if let d = Double(valStr), !d.isNaN, !d.isInfinite, d > 0 {
+                        dur = d
+                    }
+                } else if trimmed.lowercased().hasPrefix("tag:title=") {
+                    let valStr = String(trimmed.dropFirst("tag:title=".count)).trimmingCharacters(in: .whitespaces)
+                    if !valStr.isEmpty && title == nil {
+                        title = valStr
+                    }
+                } else if trimmed.lowercased().hasPrefix("tag:artist=") {
+                    let valStr = String(trimmed.dropFirst("tag:artist=".count)).trimmingCharacters(in: .whitespaces)
+                    if !valStr.isEmpty && artist == nil {
+                        artist = valStr
+                    }
+                }
+            }
+
+            return (dur, title, artist)
+        } catch {
+            return (0, nil, nil)
+        }
+    }
+
+    // 将非原生或解析失败的音频无损转码为标准 16-bit PCM WAV 缓存文件后供 AVAudioPlayer 播放
+    func transcodeToWav(sourceURL: URL) throws -> URL {
+        guard let ffmpeg = ffmpegPath else {
+            throw NSError(
+                domain: "FFmpegAudioHelper",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "未找到 ffmpeg，播放此类格式需安装 ffmpeg (如 brew install ffmpeg)"]
+            )
+        }
+
+        let attr = try? FileManager.default.attributesOfItem(atPath: sourceURL.path)
+        let fileSize = (attr?[.size] as? NSNumber)?.int64Value ?? 0
+        let modTime = (attr?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        let cacheKeyData = "\(sourceURL.path)_\(fileSize)_\(modTime)".data(using: .utf8) ?? Data()
+        let cacheKey = SHA256.hash(data: cacheKeyData).compactMap { String(format: "%02x", $0) }.joined()
+
+        let targetURL = cacheDirectory.appendingPathComponent("\(cacheKey).wav")
+
+        // 检查缓存有效性 (若已存在且大于 1KB，直接秒开复用)
+        if FileManager.default.fileExists(atPath: targetURL.path),
+           let targetAttr = try? FileManager.default.attributesOfItem(atPath: targetURL.path),
+           let targetSize = (targetAttr[.size] as? NSNumber)?.int64Value, targetSize > 1024 {
+            return targetURL
+        }
+
+        // 调用 ffmpeg 进行快速 PCM WAV 转码
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: ffmpeg)
+        process.arguments = [
+            "-y",
+            "-loglevel", "error",
+            "-i", sourceURL.path,
+            "-vn",
+            "-acodec", "pcm_s16le",
+            "-ar", "44100",
+            "-ac", "2",
+            targetURL.path
+        ]
+
+        let errPipe = Pipe()
+        process.standardError = errPipe
+
+        try process.run()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 && FileManager.default.fileExists(atPath: targetURL.path) else {
+            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            let errMsg = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "未知错误"
+            throw NSError(
+                domain: "FFmpegAudioHelper",
+                code: Int(process.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: "FFmpeg 转码失败: \(errMsg)"]
+            )
+        }
+
+        return targetURL
     }
 }
 
@@ -1368,6 +1558,7 @@ class LocalMusicPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var duration: Double = 0.0
     @Published var playlist: [LocalTrackItem] = []
     @Published var isSingleLoop: Bool = false
+    @Published var isTranscoding: Bool = false
     @Published var volume: Float = 1.0 {
         didSet {
             audioPlayer?.volume = volume
@@ -1376,6 +1567,7 @@ class LocalMusicPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private var audioPlayer: AVAudioPlayer?
     private var progressTimer: Timer?
+    private var playRequestId: UUID = UUID()
 
     override init() {
         super.init()
@@ -1393,28 +1585,79 @@ class LocalMusicPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             self.currentTrackIndex = idx
         }
 
-        do {
-            audioPlayer?.stop()
-            audioPlayer = try AVAudioPlayer(contentsOf: track.url)
-            audioPlayer?.delegate = self
-            audioPlayer?.volume = volume
-            audioPlayer?.prepareToPlay()
-            audioPlayer?.play()
+        let thisRequestId = UUID()
+        self.playRequestId = thisRequestId
 
-            self.currentTrack = track
-            self.isPlaying = true
-            self.currentTime = 0.0
-            self.duration = audioPlayer?.duration ?? track.duration
+        audioPlayer?.stop()
+        self.currentTime = 0.0
+        self.currentTrack = track
+        self.isPlaying = false
 
-            startProgressTimer()
+        let ext = track.fileExtension
+        let nativeCoreAudioExts: Set<String> = [
+            "mp3", "flac", "m4a", "wav", "aac", "alac", "aiff", "aif", "aifc", "caf", "m4b", "m4r"
+        ]
 
-            DispatchQueue.main.async {
-                LyricViewModel.shared?.playLocalTrack(track)
+        // 步骤 1：若属于 CoreAudio 原生格式，直接尝试 AVAudioPlayer 硬件解码播放
+        if nativeCoreAudioExts.contains(ext) {
+            do {
+                let player = try AVAudioPlayer(contentsOf: track.url)
+                self.setupAndStartPlayer(player, track: track, reqId: thisRequestId)
+                return
+            } catch {
+                print("CoreAudio 原生解码 \(track.url.lastPathComponent) 抛错，自动切换 FFmpeg PCM 转码回退: \(error)")
             }
-        } catch {
-            print("播放本地音频失败: \(error)")
-            showSystemBanner(title: "播放本地音频失败", informativeText: "无法播放 \(track.title): \(error.localizedDescription)")
         }
+
+        // 步骤 2：对于特殊格式 (ogg, oga, opus, ape, wma 等) 或原生直接播放抛错时：
+        // 自动使用本地 ffmpeg 转码为标准 PCM WAV 缓存文件后送入 AVAudioPlayer 播放
+        self.isTranscoding = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            do {
+                let transcodedWavURL = try FFmpegAudioHelper.shared.transcodeToWav(sourceURL: track.url)
+                let player = try AVAudioPlayer(contentsOf: transcodedWavURL)
+                DispatchQueue.main.async {
+                    guard self.playRequestId == thisRequestId else { return }
+                    self.isTranscoding = false
+                    self.setupAndStartPlayer(player, track: track, reqId: thisRequestId)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    guard self.playRequestId == thisRequestId else { return }
+                    self.isTranscoding = false
+                    print("FFmpeg 转码或播放失败: \(error)")
+                    showSystemBanner(
+                        title: "播放本地音频失败",
+                        informativeText: "无法播放 \(track.title): \(error.localizedDescription)"
+                    )
+                }
+            }
+        }
+    }
+
+    private func setupAndStartPlayer(_ player: AVAudioPlayer, track: LocalTrackItem, reqId: UUID) {
+        guard self.playRequestId == reqId else { return }
+        self.audioPlayer = player
+        player.delegate = self
+        player.volume = self.volume
+        player.prepareToPlay()
+        player.play()
+
+        self.isPlaying = true
+        let realDuration = player.duration > 0 ? player.duration : track.duration
+        self.duration = realDuration
+
+        // 时长安全校准：若曲目原时长为空或存在误差，同步校准曲库元数据，避免 00:00
+        if track.duration <= 0 || abs(track.duration - realDuration) > 1.0 {
+            LocalMusicLibrary.shared.updateTrackDuration(trackId: track.id, duration: realDuration)
+        }
+
+        startProgressTimer()
+
+        var updatedTrack = track
+        updatedTrack.duration = realDuration
+        LyricViewModel.shared?.playLocalTrack(updatedTrack)
     }
 
     func play() {
@@ -1596,7 +1839,7 @@ class LocalMusicLibrary: NSObject, ObservableObject {
             }
 
             var items: [LocalTrackItem] = []
-            let supportedExts = Set(["mp3", "flac", "m4a", "wav", "aac"])
+            let supportedExts = Set(["mp3", "flac", "m4a", "wav", "aac", "alac", "aiff", "aif", "aifc", "caf", "ogg", "oga", "opus", "ape", "wma", "m4b", "m4r"])
 
             for case let fileURL as URL in enumerator {
                 let ext = fileURL.pathExtension.lowercased()
@@ -1616,7 +1859,7 @@ class LocalMusicLibrary: NSObject, ObservableObject {
 
                 let asset = AVURLAsset(url: fileURL)
                 let dur = CMTimeGetSeconds(asset.duration)
-                let finalDur = (dur.isNaN || dur.isInfinite || dur < 0) ? 0.0 : dur
+                var finalDur = (dur.isNaN || dur.isInfinite || dur < 0) ? 0.0 : dur
 
                 for meta in asset.commonMetadata {
                     if let key = meta.commonKey?.rawValue {
@@ -1625,6 +1868,32 @@ class LocalMusicLibrary: NSObject, ObservableObject {
                             title = v.trimmingCharacters(in: .whitespaces)
                         } else if key == "artist", let v = stringVal, !v.trimmingCharacters(in: .whitespaces).isEmpty {
                             artist = v.trimmingCharacters(in: .whitespaces)
+                        }
+                    }
+                }
+
+                // 若 AVURLAsset 无法获取时长或元数据（常见于 ogg, opus, ape, wma 等特殊格式），使用 FFmpeg/ffprobe 深入探测
+                if finalDur <= 0 || title == baseName || artist == "未知歌手" {
+                    let probed = FFmpegAudioHelper.shared.probeMetadata(url: fileURL)
+                    if finalDur <= 0 && probed.duration > 0 {
+                        finalDur = probed.duration
+                    }
+                    if title == baseName, let pTitle = probed.title, !pTitle.isEmpty {
+                        title = pTitle
+                    }
+                    if artist == "未知歌手", let pArtist = probed.artist, !pArtist.isEmpty {
+                        artist = pArtist
+                    }
+                }
+
+                // 兜底时长保护：若最终依然无法获取时长，根据文件大小做安全保底估算，避免显示 00:00
+                if finalDur <= 0 {
+                    let attr = try? fm.attributesOfItem(atPath: fileURL.path)
+                    let size = (attr?[.size] as? NSNumber)?.int64Value ?? 0
+                    if size > 0 {
+                        let estimatedSec = Double(size) / (192.0 * 1024.0 / 8.0)
+                        if estimatedSec > 5.0 && estimatedSec < 7200.0 {
+                            finalDur = estimatedSec
                         }
                     }
                 }
@@ -1662,6 +1931,26 @@ class LocalMusicLibrary: NSObject, ObservableObject {
             if let idx = self.tracks.firstIndex(where: { $0.id == trackId }) {
                 self.tracks[idx].hasLrc = true
                 self.tracks[idx].lrcURL = lrcURL
+            }
+            if let idx = LocalMusicPlayer.shared.playlist.firstIndex(where: { $0.id == trackId }) {
+                LocalMusicPlayer.shared.playlist[idx].hasLrc = true
+                LocalMusicPlayer.shared.playlist[idx].lrcURL = lrcURL
+            }
+        }
+    }
+
+    func updateTrackDuration(trackId: UUID, duration: Double) {
+        guard duration > 0, !duration.isNaN, !duration.isInfinite else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if let idx = self.tracks.firstIndex(where: { $0.id == trackId }) {
+                self.tracks[idx].duration = duration
+            }
+            if let idx = LocalMusicPlayer.shared.playlist.firstIndex(where: { $0.id == trackId }) {
+                LocalMusicPlayer.shared.playlist[idx].duration = duration
+            }
+            if LocalMusicPlayer.shared.currentTrack?.id == trackId {
+                LocalMusicPlayer.shared.currentTrack?.duration = duration
             }
         }
     }
@@ -1811,6 +2100,48 @@ class LocalMusicWindowManager: NSObject, NSWindowDelegate {
     }
 }
 
+// MARK: - 高保真音频格式标签组件 (FormatBadgeView)
+struct FormatBadgeView: View {
+    let ext: String
+
+    var badgeText: String {
+        ext.uppercased()
+    }
+
+    var badgeColor: Color {
+        switch ext.lowercased() {
+        case "flac":
+            return Color(red: 1.0, green: 0.55, blue: 0.15) // FLAC: 橙色
+        case "alac", "wav", "aiff", "aif", "aifc", "caf":
+            return Color(red: 0.25, green: 0.65, blue: 1.0) // ALAC / WAV / AIFF: 蓝色
+        case "ape", "ogg", "oga", "opus":
+            return Color(red: 0.75, green: 0.45, blue: 1.0) // OGG / OPUS / APE: 紫色
+        case "wma":
+            return Color(red: 0.35, green: 0.75, blue: 0.85) // WMA: 青蓝
+        case "mp3", "aac", "m4a", "m4b", "m4r":
+            fallthrough
+        default:
+            return Color(red: 0.25, green: 0.85, blue: 0.55) // MP3 / AAC: 绿色
+        }
+    }
+
+    var body: some View {
+        Text(badgeText)
+            .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+            .foregroundColor(badgeColor)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1.5)
+            .background(
+                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                    .fill(badgeColor.opacity(0.18))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                    .stroke(badgeColor.opacity(0.35), lineWidth: 0.5)
+            )
+    }
+}
+
 struct LocalMusicView: View {
     @ObservedObject private var library = LocalMusicLibrary.shared
     @ObservedObject private var player = LocalMusicPlayer.shared
@@ -1897,6 +2228,23 @@ struct LocalMusicView: View {
                 .buttonStyle(.plain)
                 .help("关闭曲库窗口 (ESC / ⌘W)，音乐与桌面歌词将在后台持续播放")
             }
+
+            // 格式支持提示栏
+            HStack(spacing: 6) {
+                Image(systemName: "waveform.path.badge.plus")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(Color(red: 0.35, green: 0.95, blue: 0.90))
+                Text("全格式自适应: MP3 · FLAC · WAV · AAC · ALAC · AIFF · OGG · OPUS · APE · WMA · CAF")
+                    .font(.system(size: 10, design: .rounded))
+                    .foregroundColor(.white.opacity(0.65))
+                Spacer()
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.white.opacity(0.06))
+            )
 
             HStack(spacing: 8) {
                 HStack(spacing: 4) {
@@ -2005,7 +2353,7 @@ struct LocalMusicView: View {
                     Image(systemName: "music.note.slash")
                         .font(.system(size: 32))
                         .foregroundColor(.white.opacity(0.25))
-                    Text(library.tracks.isEmpty ? "当前目录下暂无音频文件 (.mp3, .flac, .m4a, .wav)" : "未找到匹配曲目")
+                    Text(library.tracks.isEmpty ? "当前目录下暂无音频文件 (支持 MP3, FLAC, WAV, AAC, ALAC, AIFF, OGG, OPUS, APE, WMA 等全格式)" : "未找到匹配曲目")
                         .font(.system(size: 13, design: .rounded))
                         .foregroundColor(.white.opacity(0.50))
                     if library.tracks.isEmpty {
@@ -2039,9 +2387,15 @@ struct LocalMusicView: View {
             // 播放指示器或序号
             Group {
                 if isCurrent {
-                    Image(systemName: player.isPlaying ? "speaker.wave.3.fill" : "speaker.fill")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(Color(red: 0.35, green: 0.95, blue: 0.90))
+                    if player.isTranscoding {
+                        ProgressView()
+                            .scaleEffect(0.55)
+                            .frame(width: 22, height: 22)
+                    } else {
+                        Image(systemName: player.isPlaying ? "speaker.wave.3.fill" : "speaker.fill")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundColor(Color(red: 0.35, green: 0.95, blue: 0.90))
+                    }
                 } else {
                     Text("\(index + 1)")
                         .font(.system(size: 11, design: .monospaced))
@@ -2065,6 +2419,9 @@ struct LocalMusicView: View {
 
             Spacer()
 
+            // 格式 Badge（FLAC 橙色、ALAC/WAV/AIFF 蓝色、MP3/AAC 绿色、OGG/APE 紫色）
+            FormatBadgeView(ext: item.fileExtension)
+
             // LRC 标签
             if item.hasLrc {
                 Text("LRC")
@@ -2077,11 +2434,15 @@ struct LocalMusicView: View {
                             .fill(Color(red: 0.20, green: 0.85, blue: 0.55).opacity(0.18))
                     )
             } else {
-                Text("无歌词")
+                Text("云歌词")
                     .font(.system(size: 9, design: .rounded))
-                    .foregroundColor(.white.opacity(0.25))
+                    .foregroundColor(.white.opacity(0.40))
                     .padding(.horizontal, 4)
                     .padding(.vertical, 2)
+                    .background(
+                        Capsule()
+                            .fill(Color.white.opacity(0.08))
+                    )
             }
 
             // 时长
@@ -2126,7 +2487,7 @@ struct LocalMusicView: View {
                 )
                 .accentColor(Color(red: 0.35, green: 0.95, blue: 0.90))
 
-                Text(formatSeconds(player.duration))
+                Text(formatSeconds(player.duration, isDuration: true))
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundColor(.white.opacity(0.50))
                     .frame(width: 36, alignment: .trailing)
@@ -2145,9 +2506,9 @@ struct LocalMusicView: View {
                                 .font(.system(size: 12, weight: .semibold, design: .rounded))
                                 .foregroundColor(.white)
                                 .lineLimit(1)
-                            Text(cur.artist)
+                            Text(cur.artist + (player.isTranscoding ? " · 解码中..." : ""))
                                 .font(.system(size: 10, design: .rounded))
-                                .foregroundColor(.white.opacity(0.50))
+                                .foregroundColor(player.isTranscoding ? Color(red: 0.35, green: 0.95, blue: 0.90) : .white.opacity(0.50))
                                 .lineLimit(1)
                         }
                         .frame(maxWidth: 180, alignment: .leading)
@@ -2203,7 +2564,10 @@ struct LocalMusicView: View {
         .background(Color.black.opacity(0.25))
     }
 
-    private func formatSeconds(_ sec: Double) -> String {
+    private func formatSeconds(_ sec: Double, isDuration: Bool = false) -> String {
+        if isDuration && (sec <= 0 || sec.isNaN || sec.isInfinite) {
+            return "--:--"
+        }
         guard sec > 0, !sec.isNaN, !sec.isInfinite else { return "00:00" }
         let total = Int(sec)
         let m = total / 60
