@@ -191,6 +191,30 @@ struct LyricLine: Identifiable, Equatable {
     let time: Double
     let text: String
     let alignment: DuetAlignment
+    let phoneticText: String?
+
+    init(id: Int, time: Double, text: String, alignment: DuetAlignment = .leading, phoneticText: String? = nil) {
+        self.id = id
+        self.time = time
+        self.text = text
+        self.alignment = alignment
+        self.phoneticText = phoneticText
+    }
+}
+
+// 粤语国语学唱跟唱模式枚举
+enum CantoneseSingMode: String, CaseIterable {
+    case standard = "standard"         // 默认标准原词
+    case bilingual = "bilingual"       // 双行学唱对照 (原词+国语谐音)
+    case phoneticOnly = "phoneticOnly" // 纯国语学唱
+
+    var displayName: String {
+        switch self {
+        case .standard: return "标准原词模式"
+        case .bilingual: return "双行学唱对照 (原词+谐音)"
+        case .phoneticOnly: return "纯国语谐音学唱"
+        }
+    }
 }
 
 class RobustLyricsCache {
@@ -293,6 +317,421 @@ class RobustLyricsCache {
     }
 }
 
+// MARK: - 4.5 粤语国语学唱音素引擎 (CantoneseHomophoneEngine)
+class CantoneseHomophoneEngine {
+    static let shared = CantoneseHomophoneEngine()
+
+    // 知名粤语歌手与乐队名单（小写，包含简繁体与英文艺名）
+    private let cantoneseArtists: Set<String> = [
+        "beyond", "黄家驹", "黃家駒", "黄贯中", "黃貫中", "黄家强", "黃家強", "叶世荣", "葉世榮",
+        "陈奕迅", "陳奕迅", "eason chan", "eason",
+        "张学友", "張學友", "jacky cheung",
+        "李克勤", "hacken lee",
+        "谭咏麟", "譚詠麟", "alan tam",
+        "张国荣", "張國榮", "leslie cheung", "哥哥",
+        "王菲", "faye wong", "王靖雯",
+        "杨千嬅", "楊千嬅", "miriam yeung",
+        "容祖儿", "容祖兒", "joey yung",
+        "陈慧娴", "陳慧嫻", "priscilla chan",
+        "林子祥", "george lam",
+        "许冠杰", "許冠傑", "sam hui",
+        "邓紫棋", "鄧紫棋", "g.e.m.",
+        "梅艳芳", "梅艷芳", "anita mui",
+        "叶倩文", "葉蒨文", "sally yeh",
+        "林忆莲", "林憶蓮", "sandy lam",
+        "罗文", "羅文", "关正杰", "關正傑",
+        "郑少秋", "鄭少秋", "徐小凤", "徐小鳳",
+        "刘德华", "劉德華", "andy lau",
+        "黎明", "leon lai",
+        "郭富城", "aaron kwok",
+        "古巨基", "leo ku",
+        "谢霆锋", "謝霆鋒", "nicholas tse",
+        "张敬轩", "張敬軒", "hins cheung",
+        "卫兰", "衛蘭", "janice vidal",
+        "侧田", "側田", "周柏豪", "pakho chau",
+        "陈小春", "陳小春", "郑伊健", "鄭伊健",
+        "草蜢", "grasshopper", "twins", "蔡卓妍", "钟欣潼", "鍾欣潼",
+        "达明一派", "達明一派", "黄耀明", "黃耀明",
+        "太极", "太極", "温拿", "关淑怡", "關淑怡",
+        "卢巧音", "盧巧音", "何韵诗", "何韻詩",
+        "薛凯琪", "薛凱琪", "吴雨霏", "吳雨霏",
+        "梁汉文", "梁漢文", "苏永康", "蘇永康",
+        "钟镇涛", "鍾鎮濤", "许志安", "許志安",
+        "谢安琪", "謝安琪", "my little airport",
+        "软硬天师", "軟硬天師", "林峰", "林峯"
+    ]
+
+    // 经典粤语歌曲名单（包含简繁体）
+    private let cantoneseSongs: Set<String> = [
+        "海阔天空", "海闊天空", "光辉岁月", "光輝歲月", "喜欢你", "喜歡你", "大地", "真的爱你", "真的愛你",
+        "冷雨夜", "情人", "不再犹豫", "不再猶豫", "灰色轨迹", "灰色軌跡", "岁月的童话", "长城", "長城",
+        "无尽空虚", "無盡空虛", "逝去日子", "旧日的足迹", "无悔这一生", "誰伴我闖蕩", "谁伴我闯荡",
+        "富士山下", "浮夸", "浮誇", "明年今日", "k歌之王", "单车", "單車", "最佳损友", "最佳損友",
+        "落花流水", "陀飞轮", "陀飛輪", "葡萄成熟时", "葡萄成熟時", "苦瓜", "一丝不挂", "一丝不掛",
+        "沙龙", "沙龍", "不如不见", "不如不見", "白玫瑰", "人来人往", "人來人往", "无人之境", "無人之境",
+        "天下无双", "天下無雙", "连续剧", "十面埋伏", "黄金时代", "黃金時代", "防不胜防",
+        "月半小夜曲", "红日", "紅日", "一生中最爱", "一生中最愛", "护花使者", "護花使者",
+        "讲不出再见", "講不出再見", "水中花", "爱在深秋", "愛在深秋", "朋友", "卡拉永远ok",
+        "爱情陷阱", "愛情陷阱", "雾之恋", "霧之戀", "大会堂演奏厅", "大會堂演奏廳", "旧欢如梦", "舊歡如夢",
+        "偏偏喜欢你", "偏偏喜歡你", "一生何求", "念亲恩", "念親恩", "涟漪", "漣漪", "今宵多珍重", "等",
+        "遥远的她", "遙遠的她", "李香兰", "李香蘭", "每天爱你多一些", "每天愛你多一些", "只想一生跟你走",
+        "饿狼传说", "餓狼傳說", "头发乱了", "頭髮亂了", "旧情绵绵", "舊情綿綿", "夕阳醉了", "夕陽醉了", "离开以后", "離開以後",
+        "千千阙歌", "千千闕歌", "飘雪", "飄雪", "红茶馆", "紅茶館", "傻女", "人生何处不相逢", "人生何處不相逢", "归来吧", "歸來吧",
+        "处处吻", "處處吻", "喜帖街", "友情岁月", "友情歲月", "乱世巨星", "亂世巨星", "热血燃烧", "熱血燃燒",
+        "倩女幽魂", "风继续吹", "風繼續吹", "monica", "沉默是金", "当年情", "當年情", "追", "有心人",
+        "春光乍泄", "春光乍洩", "今生今世", "左右手", "玻璃之情", "怪你过分美丽", "怪你過分美麗", "风再起时", "風再起時",
+        "容易受伤的女人", "容易受傷的女人", "约定", "約定", "给自己的情书", "給自己的情書", "暧昧", "曖昧", "冷战", "冷戰",
+        "少女的祈祷", "少女的祈禱", "可惜我是水瓶座", "勇", "野孩子", "小城大事", "飞女正传", "飛女正傳",
+        "痛爱", "痛愛", "心淡", "我的骄傲", "我的驕傲", "搜神记", "搜神記",
+        "男儿当自强", "男兒當自強", "沧海一声笑", "滄海一聲笑", "万里长城永不倒", "萬里長城永不倒",
+        "铁血丹心", "鐵血丹心", "世间始终你好", "世間始終你好", "难念的经", "難念的經", "万水千山总是情", "萬水千山總是情",
+        "上海滩", "上海灘", "酷爱", "酷愛", "樱花树下", "櫻花樹下", "春秋", "笑忘书", "笑忘書",
+        "倾城", "傾城", "烂泥", "爛泥", "七友", "钟无艳", "鍾無艷", "年度之歌", "好心分手", "相思风雨中",
+        "现代爱情故事", "片片枫叶情", "片片楓葉情", "分分钟需要你", "分分鐘需要你"
+    ]
+
+    // 独有方言特征字词
+    private let dialectKeywords: [String] = [
+        "嘅", "喺", "咗", "哋", "唔", "乜", "咁", "点解", "睇", "边度",
+        "冇", "啱", "啲", "鍾意", "钟意", "仲", "諗", "搵", "屋企", "靓",
+        "靚", "乜嘢", "乜野", "點解", "點樣", "喺度", "咪", "畀", "俾", "㗎",
+        "嘎", "喎", "嗱", "啫", "嘞", "几时", "幾時", "点算", "點算", "掟",
+        "揾", "睇见", "睇見", "细路", "細路", "得闲", "得閑", "返工", "放工", "执笠",
+        "拍拖", "埋单", "遮仔", "攰", "嘈", "生性", "孤寒"
+    ]
+
+    // 高保真长词组映射 (优先精确命中经典金曲歌词)
+    private let phraseMap: [String: String] = [
+        // 海阔天空
+        "今天我": "跟天我",
+        "寒夜里看雪飘过": "寒爷雷憨雪piu果",
+        "寒夜里": "寒爷雷",
+        "看雪飘过": "憨雪piu果",
+        "怀着冷却了的心窝": "歪这冷阔留的散窝",
+        "冷却了的心窝": "冷阔留的散窝",
+        "冷却了": "冷阔留",
+        "心窝": "散窝",
+        "飘远方": "piu云方",
+        "风雨里追赶": "风雨雷最赶",
+        "风雨里": "风雨雷",
+        "雾里分不清影踪": "某雷分八轻硬总",
+        "分不清影踪": "分八轻硬总",
+        "天空海阔你与我": "天轰海阔内与我",
+        "天空海阔": "天轰海阔",
+        "海阔天空": "海阔天轰",
+        "你与我": "内与我",
+        "可会变": "活位宾",
+        "原谅我这一生不羁放纵爱自由": "云棱我杰伤八给放纵爱挤有",
+        "原谅我这一生": "云棱我杰伤",
+        "原谅我": "云棱我",
+        "这一生": "杰伤",
+        "不羁放纵爱自由": "八给放纵爱挤有",
+        "不羁放纵": "八给放纵",
+        "爱自由": "爱挤有",
+        "也会怕有一天会跌倒": "呀位怕有跟天位弟兜",
+        "也会怕": "呀位怕",
+        "有一天会跌倒": "有跟天位弟兜",
+        "背弃了理想": "杯黑留雷赏",
+        "谁人都可以": "谁人兜活以",
+        "哪会怕有一天只你共我": "哪位怕有跟天几内工我",
+        "哪会怕": "哪位怕",
+        "只你共我": "几内工我",
+        "仍然自由自我": "影银挤有挤我",
+        "自由自我": "挤有挤我",
+        "永远高唱我歌": "wing云高唱我果",
+        "走遍千里": "走拼亲雷",
+
+        // 光辉岁月
+        "光辉岁月": "广飞虽鱼",
+        "钟声响起归家的讯号": "总星响黑乖嘎的森厚",
+        "在他生命里": "在它伤命雷",
+        "彷佛带点唏嘘": "芳发代点黑挥",
+        "黑色肌肤给他的意义": "哈色给夫给它的意意",
+        "是一生奉献": "细压伤风恨",
+        "年月把拥有变做失去": "宁鱼把拥有宾走撒挥",
+        "疲倦的双眼带着期望": "配圈的桑按代这尅忙",
+        "今天只有残留的躯壳": "跟天几有苍楼的亏霍",
+        "迎接光辉岁月": "迎及广飞虽鱼",
+        "风雨中抱紧自由": "风雨总剖赶挤有",
+        "一生经过傍徨的挣扎": "压伤轻果旁王的发展",
+        "自信可改变未来": "挤森活改宾美莱",
+        "问谁又能做到": "门谁骚能走兜",
+
+        // 喜欢你
+        "喜欢你": "黑风内",
+        "那双眼动人": "那桑按动人",
+        "笑声更迷人": "修星更埋人",
+        "愿再可": "云在活",
+        "轻抚你": "轻夫内",
+        "那可爱面容": "那活爱民容",
+        "挽手说梦话": "晚骚许梦哇",
+        "像昨天你共我": "抢昨听内工我",
+        "像昨天": "抢昨听",
+        "你共我": "内工我",
+        "满带愤怒的眼睛": "门代份楼的按精",
+        "心里感叹": "散雷感贪",
+        "细雨带风湿透黄昏的街道": "腮雨代风撒套王芬的该兜",
+        "抹去雨水双眼无故地仰望": "目挥雨谁桑按某故地样忙",
+        "以往的不知不觉的逃避": "依网的八挤八果的头杯",
+
+        // 富士山下 / 明年今日
+        "富士山下": "富及散哈",
+        "情人难免沦为朋友": "晴人难敏轮歪朋有",
+        "情人难免": "晴人难敏",
+        "沦为朋友": "轮歪朋有",
+        "曾沿着雪路浪游": "苍云这雪楼龙骚",
+        "曾沿着雪路": "苍云这雪楼",
+        "为何为好事泪流": "歪活歪厚细雷楼",
+        "谁能凭爱意要富士山私有": "谁能凭爱意优富及散细有",
+        "人活到几岁算短": "人乌兜给虽勋盾",
+        "失恋只有更短": "撒轮几有更盾",
+        "明年今日": "名宁跟呀",
+
+        // 浮夸
+        "浮夸": "抱夸",
+        "有人来拍照要记住插袋": "有人莱怕照优给挤擦带",
+        "你当我是浮夸吧": "内动我细抱夸吧",
+        "夸张只因我很怕": "夸张几淹我痕怕",
+        "幸运儿并不多": "航稳儿并八多",
+        "着最闪的衫": "这最信的散",
+
+        // 月半小夜曲
+        "月半小夜曲": "鱼奔休夜扣",
+        "仍然倚在失眠夜": "影银衣在撒民爷",
+        "望天边星宿": "忙天宾星骚",
+        "仍然听见小提琴": "影银听金休台肯",
+        "如泣如诉在心头": "鱼哈鱼首在散头",
+        "为何心事不能说": "歪活散细八能许",
+        "为何偏偏喜欢你": "歪活拼拼黑风内",
+        "她似这月儿": "它起杰鱼儿",
+
+        // 红日
+        "红日": "轰呀",
+        "命运就算颠沛流离": "命稳走算叮佩楼雷",
+        "命运就算曲折离奇": "命稳走算阔及雷尅",
+        "命运就算恐吓着你": "命稳走算轰哈这内",
+        "做人没趣味": "走人木脆味",
+        "别流泪心酸": "必楼雷散勋",
+        "更不应舍弃": "更八应赛尅",
+        "我愿能一生永远陪伴你": "我云能压伤wing云培喷内",
+        "一生永远陪伴你": "压伤wing云培喷内",
+
+        // 讲不出再见
+        "讲不出再见": "港八绰在宾",
+        "是对是错": "细对细搓",
+        "浮沉在美梦里": "抱沉在美梦雷",
+
+        // 偏偏喜欢你
+        "偏偏喜欢你": "拼拼黑风内",
+        "为何我心一片空虚": "歪活我散压拼轰黑",
+        "满腔恨愁不可消除": "门轰痕骚八活修除",
+
+        // 遥远的她
+        "遥远的她": "幽云的她",
+        "不可以归去": "八活以乖挥",
+        "遥遥万里": "幽幽慢雷",
+
+        // 千千阙歌
+        "千千阙歌": "亲亲库果",
+        "徐徐回望": "吹吹位忙",
+        "来日纵使千千阕歌": "莱呀纵细亲亲库果",
+        "飘于远方我路上": "piu于云方我楼桑",
+        "来日纵使千千晚星": "莱呀纵细亲亲满星",
+        "亮过今晚月亮": "棱果跟满鱼棱",
+        "都比不起这宵美丽": "兜杯八黑杰休美莱",
+
+        // 处处吻 / 喜帖街 / 友情岁月
+        "处处吻": "曲曲门",
+        "一吻便颠倒众生": "压门宾叮兜总伤",
+        "一吻便偷一个心": "压门宾头压个散",
+        "一吻便救一个人": "压门宾告压个人",
+        "喜帖街": "黑踢该",
+        "友情岁月": "骚晴虽鱼",
+        "消失的光阴散在风里": "休撒的广淹散在风雷",
+        "来忘掉错对": "莱忙丢搓对",
+        "来怀念过去": "莱歪另果挥",
+        "共挽手到未来": "工晚骚兜美莱",
+
+        // 通用高频词组
+        "不知道": "八挤兜",
+        "知道": "挤兜",
+        "明白": "民八",
+        "开心": "嗨散",
+        "伤心": "伤散",
+        "一生": "压伤",
+        "一世": "压腮",
+        "世界": "腮该",
+        "朋友": "朋有",
+        "如果": "鱼果",
+        "只要": "挤优",
+        "时间": "时甘",
+        "回忆": "微意",
+        "过去": "果挥",
+        "未来": "美莱",
+        "梦想": "梦赏",
+        "理想": "雷赏",
+        "相爱": "桑爱",
+        "分开": "分嗨",
+        "离开": "雷嗨",
+        "永远": "wing云",
+        "曾经": "苍轻",
+        "现在": "银在",
+        "可以": "活以",
+        "不能": "八能",
+        "不可以": "八活以",
+        "对不起": "对八起",
+        "多谢": "多借",
+        "唔该": "嗯乖",
+        "点解": "点改",
+        "点样": "点羊",
+        "屋企": "屋尅",
+        "点算": "点勋",
+        "乜嘢": "乜也",
+        "睇见": "太金",
+        "钟意": "总意",
+        "鍾意": "總意",
+        "相信": "桑森",
+        "眼泪": "按雷",
+        "故事": "故细",
+        "最后": "最厚",
+        "从前": "从亲",
+        "继续": "给族"
+    ]
+
+    private let phraseMaxLen: Int
+
+    // 常用字普通话学唱谐音字典 (单字音节保底)
+    private let charMap: [Character: String] = [
+        "我": "我", "你": "内", "佢": "亏", "他": "他", "她": "她", "它": "它", "们": "门", "哋": "地",
+        "的": "的", "嘅": "给", "喺": "海", "咗": "佐", "唔": "嗯", "乜": "灭", "咁": "敢", "冇": "某",
+        "睇": "太", "諗": "蓝", "搵": "稳", "啱": "昂", "啲": "低", "係": "嗨", "㗎": "嘎", "仲": "重",
+        "一": "压", "二": "意", "三": "散", "四": "细", "五": "嗯", "六": "漏", "七": "擦", "八": "八",
+        "九": "告", "十": "撒", "百": "八", "千": "亲", "万": "慢", "萬": "慢", "亿": "意", "億": "意",
+        "心": "散", "痛": "通", "伤": "伤", "傷": "伤", "爱": "爱", "愛": "爱", "恨": "痕", "情": "晴",
+        "愁": "骚", "悲": "杯", "欢": "风", "歡": "风", "乐": "咯", "樂": "咯", "喜": "黑", "怒": "楼",
+        "哀": "哀", "怨": "云", "叹": "贪", "念": "另", "恋": "轮", "戀": "轮", "痴": "挤", "癡": "挤",
+        "狂": "狂", "醉": "醉", "醒": "星", "梦": "梦", "夢": "梦", "想": "赏", "望": "忙", "盼": "胖",
+        "祈": "尅", "祷": "兜", "愿": "云", "願": "云", "苦": "夫", "甜": "甜", "酸": "勋", "怕": "怕",
+        "惊": "精", "驚": "精", "慌": "风", "忧": "骚", "懷": "歪", "怀": "歪", "忆": "意", "憶": "意",
+        "记": "给", "記": "给", "忘": "忙",
+        "天": "天", "地": "地", "日": "呀", "月": "鱼", "星": "星", "宿": "骚", "辰": "散", "云": "云",
+        "雲": "云", "雨": "雨", "雷": "雷", "电": "叮", "電": "叮", "风": "风", "風": "风", "雪": "雪",
+        "霜": "桑", "雾": "某", "霧": "某", "露": "楼", "海": "海", "河": "活", "江": "公", "湖": "乌",
+        "山": "散", "水": "谁", "石": "赛", "浪": "龙", "潮": "秋", "花": "发", "草": "草", "木": "木",
+        "树": "虽", "樹": "虽", "枝": "挤", "叶": "鱼", "葉": "鱼", "光": "广", "影": "硬", "色": "色",
+        "彩": "彩", "夜": "爷", "晚": "满", "昨": "昨", "今": "跟", "明": "名", "岁": "虽", "歲": "虽",
+        "年": "宁", "春": "春", "夏": "哈", "秋": "秋", "冬": "冬", "时": "时", "時": "时", "刻": "哈",
+        "分": "分", "秒": "秒", "空": "轰", "间": "甘", "間": "甘", "世": "腮", "界": "该", "尘": "散",
+        "塵": "散", "凡": "凡", "人": "人",
+        "看": "憨", "见": "金", "見": "金", "观": "滚", "觀": "滚", "听": "听", "聽": "听", "闻": "门",
+        "聞": "门", "说": "许", "說": "许", "讲": "港", "講": "港", "话": "哇", "話": "哇", "唱": "唱",
+        "歌": "果", "叫": "giu", "喊": "喊", "问": "门", "問": "门", "答": "打", "呼": "夫", "吸": "哈",
+        "吹": "吹", "吻": "门", "笑": "修", "哭": "轰", "泣": "哈", "走": "走", "行": "航", "跑": "剖",
+        "飞": "飞", "飛": "飞", "跳": "挑", "游": "骚", "进": "针", "進": "针", "退": "推", "出": "绰",
+        "入": "呀", "来": "莱", "來": "莱", "去": "挥", "回": "位", "到": "兜", "达": "打", "達": "打",
+        "过": "果", "過": "果", "留": "楼", "停": "挺", "追": "最", "赶": "赶", "趕": "赶", "寻": "沉",
+        "尋": "沉", "找": "早", "得": "得", "失": "撒", "弃": "黑", "棄": "黑", "舍": "赛", "捨": "赛",
+        "拥": "拥", "擁": "拥", "抱": "剖", "挽": "晚", "牵": "黑", "牽": "黑", "放": "放", "送": "轰",
+        "迎": "迎", "陪": "培", "伴": "喷", "随": "虽", "隨": "虽", "依": "衣", "靠": "靠", "凭": "凭",
+        "变": "宾", "變": "宾", "化": "发", "改": "改", "换": "晕", "換": "晕", "转": "军", "轉": "军",
+        "移": "衣", "动": "动", "動": "动", "静": "静", "靜": "静", "起": "黑", "落": "咯", "升": "星",
+        "降": "红", "浮": "抱", "沉": "沉", "飘": "piu", "飄": "piu", "摇": "骚", "摆": "摆", "擺": "摆",
+        "荡": "烫", "散": "散", "聚": "最", "离": "雷", "離": "雷", "合": "哈", "破": "破", "碎": "虽",
+        "断": "盾", "斷": "盾", "续": "族", "續": "族", "结": "给", "結": "给", "终": "总", "終": "总",
+        "始": "启", "开": "嗨", "開": "嗨", "关": "关", "關": "关", "闭": "摆", "閉": "摆",
+        "好": "厚", "坏": "歪", "壞": "歪", "美": "美", "丽": "莱", "麗": "莱", "丑": "骚", "醜": "骚",
+        "靓": "棱", "靚": "棱", "帅": "虽", "帥": "虽", "高": "高", "低": "呆", "长": "长", "長": "长",
+        "短": "盾", "大": "代", "小": "休", "多": "多", "少": "休", "冷": "冷", "暖": "轮", "温": "温",
+        "溫": "温", "热": "意", "熱": "意", "凉": "棱", "涼": "棱", "寒": "寒", "冻": "冬", "凍": "冬",
+        "冰": "冰", "真": "赞", "假": "嘎", "虚": "规", "实": "撒", "實": "撒", "错": "搓", "錯": "搓",
+        "对": "对", "對": "对", "是": "细", "非": "飞", "难": "难", "難": "难", "易": "意", "紧": "赶",
+        "緊": "赶", "慢": "慢", "快": "快", "急": "给", "远": "云", "遠": "云", "近": "干", "深": "森",
+        "浅": "亲", "淺": "亲", "厚": "厚", "薄": "薄", "强": "强", "強": "强", "弱": "鱼", "软": "运",
+        "軟": "运", "硬": "按", "独": "独", "孤": "咕", "单": "单", "單": "单", "满": "门", "滿": "门",
+        "闹": "闹", "喧": "勋", "嚣": "休", "寂": "及", "寞": "莫", "茫": "忙", "迷": "埋", "乱": "轮",
+        "稳": "稳", "穩": "稳", "不": "八", "莫": "莫", "勿": "勿", "别": "必", "別": "必", "没": "木",
+        "沒": "木", "无": "某", "無": "某", "未": "美", "否": "否", "亦": "也", "又": "骚", "再": "在",
+        "更": "更", "甚": "散", "最": "最", "极": "给", "極": "给", "很": "痕", "太": "太", "偏": "拼",
+        "只": "几", "唯": "歪", "但": "但", "却": "确", "卻": "确", "然": "银", "若": "鱼", "如": "鱼",
+        "纵": "纵", "虽": "虽", "雖": "虽", "即": "给", "便": "宾", "就": "走", "乃": "乃", "则": "扎",
+        "因": "淹", "为": "歪", "為": "歪", "故": "故", "所": "所", "以": "以", "与": "与", "與": "与",
+        "及": "哈", "同": "同", "共": "工", "和": "活", "从": "从", "自": "挤", "由": "骚", "于": "于",
+        "於": "于", "在": "在", "向": "红", "往": "网", "当": "动", "當": "动", "将": "针", "將": "针",
+        "把": "把", "被": "杯", "让": "让", "讓": "让", "使": "细", "令": "令", "给": "给", "給": "给",
+        "谁": "谁", "誰": "谁", "何": "活", "哪": "哪", "怎": "针", "么": "么", "樣": "羊", "样": "羊",
+        "几": "给", "幾": "给", "许": "许", "每": "每", "各": "各", "都": "兜", "全": "青", "齐": "擦",
+        "尽": "针", "皆": "该"
+    ]
+
+    private init() {
+        self.phraseMaxLen = phraseMap.keys.map { $0.count }.max() ?? 10
+    }
+
+    /// 粤语歌曲启发式识别器
+    func isCantoneseSong(title: String, artist: String, lyrics: String) -> Bool {
+        let lowTitle = cleanTrackTitle(title).lowercased()
+        let lowArtist = cleanArtistName(artist).lowercased()
+
+        // 1. 歌手列表匹配
+        for a in cantoneseArtists {
+            if lowArtist.contains(a) {
+                return true
+            }
+        }
+
+        // 2. 经典歌名匹配
+        for s in cantoneseSongs {
+            if lowTitle.contains(s.lowercased()) {
+                return true
+            }
+        }
+
+        // 3. 歌词方言独有特征词匹配
+        for kw in dialectKeywords {
+            if lyrics.contains(kw) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    /// 转换为国语学唱跟唱谐音 (长词组最长优先匹配 + 常用字音节兜底)
+    func convertToHomophone(_ text: String) -> String {
+        guard !text.isEmpty else { return "" }
+        let chars = Array(text)
+        var result = ""
+        var i = 0
+        let count = chars.count
+
+        while i < count {
+            var matched = false
+            let maxL = min(phraseMaxLen, count - i)
+            if maxL >= 2 {
+                for len in stride(from: maxL, through: 2, by: -1) {
+                    let sub = String(chars[i..<(i + len)])
+                    if let ph = phraseMap[sub] {
+                        result.append(ph)
+                        i += len
+                        matched = true
+                        break
+                    }
+                }
+            }
+            if !matched {
+                let c = chars[i]
+                if let ph = charMap[c] {
+                    result.append(ph)
+                } else {
+                    result.append(c)
+                }
+                i += 1
+            }
+        }
+        return result
+    }
+}
+
 // MARK: - 5. 增强型三源级联检索引擎 (防串曲、防伴奏、防翻唱多维评分系统)
 class LyricsEngine {
     static let shared = LyricsEngine()
@@ -302,7 +741,7 @@ class LyricsEngine {
 
         if !forceRefresh {
             if let cached = RobustLyricsCache.shared.get(artist: artist, title: title) {
-                let lines = parseLRC(cached, artist: artist)
+                let lines = parseLRC(cached, artist: artist, title: title)
                 if !lines.isEmpty {
                     completion(lines)
                     return
@@ -322,7 +761,7 @@ class LyricsEngine {
         fetchFromNetease(rawTitle: cleanT, rawArtist: cleanA, simpTitle: simpT, simpArtist: simpA, spotifySec: spotifySec) { [weak self] lrc1 in
             guard let self = self else { return }
             if let lrc = lrc1, !RobustLyricsCache.shared.isInvalidLyricContent(lrc) {
-                let lines = self.parseLRC(lrc, artist: artist)
+                let lines = self.parseLRC(lrc, artist: artist, title: title)
                 if !lines.isEmpty {
                     RobustLyricsCache.shared.set(artist: artist, title: title, lyric: lrc)
                     completion(lines)
@@ -334,7 +773,7 @@ class LyricsEngine {
             self.fetchFromQQMusic(rawTitle: cleanT, rawArtist: cleanA, simpTitle: simpT, simpArtist: simpA, spotifySec: spotifySec) { [weak self] lrc2 in
                 guard let self = self else { return }
                 if let lrc = lrc2, !RobustLyricsCache.shared.isInvalidLyricContent(lrc) {
-                    let lines = self.parseLRC(lrc, artist: artist)
+                    let lines = self.parseLRC(lrc, artist: artist, title: title)
                     if !lines.isEmpty {
                         RobustLyricsCache.shared.set(artist: artist, title: title, lyric: lrc)
                         completion(lines)
@@ -346,7 +785,7 @@ class LyricsEngine {
                 self.fetchFromLRCLIB(title: simpT, artist: simpA, spotifySec: spotifySec) { [weak self] lrc3 in
                     guard let self = self else { return }
                     if let lrc = lrc3, !RobustLyricsCache.shared.isInvalidLyricContent(lrc) {
-                        let lines = self.parseLRC(lrc, artist: artist)
+                        let lines = self.parseLRC(lrc, artist: artist, title: title)
                         if !lines.isEmpty {
                             RobustLyricsCache.shared.set(artist: artist, title: title, lyric: lrc)
                             completion(lines)
@@ -577,8 +1016,9 @@ class LyricsEngine {
         }.resume()
     }
 
-    func parseLRC(_ lrc: String, artist: String = "") -> [LyricLine] {
+    func parseLRC(_ lrc: String, artist: String = "", title: String = "") -> [LyricLine] {
         var result: [LyricLine] = []
+        let isCantonese = CantoneseHomophoneEngine.shared.isCantoneseSong(title: title, artist: artist, lyrics: lrc)
         let lines = lrc.components(separatedBy: .newlines)
 
         var globalOffsetSeconds: Double = 0.0
@@ -616,7 +1056,8 @@ class LyricsEngine {
 
                 if let m = Double(mStr), let s = Double(sStr) {
                     let adjustedTime = max(0.0, m * 60.0 + s + globalOffsetSeconds)
-                    result.append(LyricLine(id: lineIndex, time: adjustedTime, text: cleanText, alignment: align))
+                    let phonetic = isCantonese ? CantoneseHomophoneEngine.shared.convertToHomophone(cleanText) : nil
+                    result.append(LyricLine(id: lineIndex, time: adjustedTime, text: cleanText, alignment: align, phoneticText: phonetic))
                     lineIndex += 1
                 }
             }
@@ -750,6 +1191,7 @@ class LyricViewModel: ObservableObject {
     @Published var userSelectedFontSize: CGFloat = 30.0
     @Published var isAlwaysOnTop: Bool = false
     @Published var playbackSource: PlaybackSource = .spotify
+    @Published var cantoneseSingMode: CantoneseSingMode = .bilingual
 
     var onToggleAlwaysOnTop: (() -> Void)?
     var onMinimizeWindow: (() -> Void)?
@@ -786,7 +1228,26 @@ class LyricViewModel: ObservableObject {
         self.mainFontSize = self.userSelectedFontSize
         self.isAlwaysOnTop = UserDefaults.standard.bool(forKey: "isAlwaysOnTop")
 
+        let savedSingMode = UserDefaults.standard.string(forKey: "CantoneseSingMode") ?? CantoneseSingMode.bilingual.rawValue
+        self.cantoneseSingMode = CantoneseSingMode(rawValue: savedSingMode) ?? .bilingual
+
         setupDistributedNotification()
+    }
+
+    func setCantoneseSingMode(_ mode: CantoneseSingMode) {
+        self.cantoneseSingMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: "CantoneseSingMode")
+    }
+
+    func toggleCantoneseSingMode() {
+        switch cantoneseSingMode {
+        case .standard:
+            setCantoneseSingMode(.bilingual)
+        case .bilingual:
+            setCantoneseSingMode(.phoneticOnly)
+        case .phoneticOnly:
+            setCantoneseSingMode(.standard)
+        }
     }
 
     func setTheme(_ t: LyricTheme) {
@@ -900,7 +1361,7 @@ class LyricViewModel: ObservableObject {
         if FileManager.default.fileExists(atPath: lrcURL.path),
            let lrcContent = try? String(contentsOf: lrcURL, encoding: .utf8),
            !lrcContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let lines = LyricsEngine.shared.parseLRC(lrcContent, artist: track.artist)
+            let lines = LyricsEngine.shared.parseLRC(lrcContent, artist: track.artist, title: track.title)
             if !lines.isEmpty {
                 self.lyrics = lines
                 self.isShowingLyrics = true
@@ -1185,19 +1646,59 @@ struct LyricFloatingView: View {
 
         return VStack {
             if let line = curLine {
-                Text(line.text.isEmpty ? "···" : line.text)
+                if vm.cantoneseSingMode == .bilingual, let phonetic = line.phoneticText, !phonetic.isEmpty {
+                    VStack(spacing: 3) {
+                        Text(line.text.isEmpty ? "···" : line.text)
+                            .font(.system(size: vm.mainFontSize, weight: .bold, design: .rounded))
+                            .tracking(0.4)
+                            .foregroundColor(vm.theme.focusColor)
+                            .shadow(color: Color.black.opacity(0.70), radius: 1.5, x: 0, y: 1.0)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.35)
+
+                        Text(phonetic)
+                            .font(.system(size: max(11, vm.mainFontSize * 0.65), weight: .medium, design: .rounded))
+                            .tracking(0.3)
+                            .foregroundColor(Color(red: 248/255, green: 200/255, blue: 88/255))
+                            .shadow(color: Color.black.opacity(0.60), radius: 1.2, x: 0, y: 1.0)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.35)
+                    }
                     .id(line.id)
-                    .font(.system(size: vm.mainFontSize, weight: .bold, design: .rounded))
-                    .tracking(0.4)
-                    .foregroundColor(vm.theme.focusColor)
-                    .shadow(color: Color.black.opacity(0.70), radius: 1.5, x: 0, y: 1.0)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.35)
                     .padding(.horizontal, 22)
                     .transition(.asymmetric(
                         insertion: .opacity.combined(with: .offset(y: 8)),
                         removal: .opacity.combined(with: .offset(y: -8))
                     ))
+                } else if vm.cantoneseSingMode == .phoneticOnly, let phonetic = line.phoneticText, !phonetic.isEmpty {
+                    Text(phonetic)
+                        .id(line.id)
+                        .font(.system(size: vm.mainFontSize, weight: .bold, design: .rounded))
+                        .tracking(0.4)
+                        .foregroundColor(Color(red: 248/255, green: 200/255, blue: 88/255))
+                        .shadow(color: Color.black.opacity(0.70), radius: 1.5, x: 0, y: 1.0)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.35)
+                        .padding(.horizontal, 22)
+                        .transition(.asymmetric(
+                            insertion: .opacity.combined(with: .offset(y: 8)),
+                            removal: .opacity.combined(with: .offset(y: -8))
+                        ))
+                } else {
+                    Text(line.text.isEmpty ? "···" : line.text)
+                        .id(line.id)
+                        .font(.system(size: vm.mainFontSize, weight: .bold, design: .rounded))
+                        .tracking(0.4)
+                        .foregroundColor(vm.theme.focusColor)
+                        .shadow(color: Color.black.opacity(0.70), radius: 1.5, x: 0, y: 1.0)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.35)
+                        .padding(.horizontal, 22)
+                        .transition(.asymmetric(
+                            insertion: .opacity.combined(with: .offset(y: 8)),
+                            removal: .opacity.combined(with: .offset(y: -8))
+                        ))
+                }
             } else {
                 Text("🎵 前奏中...")
                     .font(.system(size: vm.mainFontSize, weight: .medium, design: .rounded))
@@ -1235,28 +1736,78 @@ struct LyricFloatingView: View {
                         Spacer()
                     }
 
-                    Text(line.text.isEmpty ? "···" : line.text)
-                        // 关键：字号与字重（.semibold）全局恒定统一！绝对不在当前行/非当前行切换字重，彻底消除从粗体切换到细体时字符宽度突变引发的抽搐跳动！
-                        .font(.system(
-                            size: vm.mainFontSize,
-                            weight: .semibold,
-                            design: .rounded
-                        ))
-                        .tracking(0.3)
-                        .foregroundColor(isCur ? vm.theme.focusColor : vm.theme.dimColor.opacity(opacity))
-                        .shadow(color: Color.black.opacity(isCur ? 0.65 : 0.25), radius: 1.5, x: 0, y: 1.0)
-                        // 关键：纯 GPU 硬件纹理缩放，零 CPU 参与，彻底消除文字字距物理抖动！
+                    if isCur && vm.cantoneseSingMode == .bilingual, let phonetic = line.phoneticText, !phonetic.isEmpty {
+                        VStack(alignment: line.alignment == .leading ? .leading : (line.alignment == .trailing ? .trailing : .center), spacing: 2) {
+                            Text(line.text.isEmpty ? "···" : line.text)
+                                .font(.system(size: vm.mainFontSize * 0.92, weight: .semibold, design: .rounded))
+                                .tracking(0.3)
+                                .foregroundColor(vm.theme.focusColor)
+                                .shadow(color: Color.black.opacity(0.65), radius: 1.5, x: 0, y: 1.0)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.35)
+
+                            Text(phonetic)
+                                .font(.system(size: max(10, vm.mainFontSize * 0.60), weight: .medium, design: .rounded))
+                                .tracking(0.2)
+                                .foregroundColor(Color(red: 248/255, green: 200/255, blue: 88/255))
+                                .shadow(color: Color.black.opacity(0.60), radius: 1.2, x: 0, y: 1.0)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.35)
+                        }
                         .scaleEffect(
                             scale,
                             anchor: line.alignment == .leading ? .leading : (line.alignment == .trailing ? .trailing : .center)
                         )
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.35)
                         .padding(.horizontal, 22)
                         .contentShape(Rectangle())
                         .onTapGesture {
                             vm.seekToLine(time: line.time)
                         }
+                    } else if vm.cantoneseSingMode == .phoneticOnly, let phonetic = line.phoneticText, !phonetic.isEmpty {
+                        Text(phonetic)
+                            .font(.system(
+                                size: vm.mainFontSize,
+                                weight: .semibold,
+                                design: .rounded
+                            ))
+                            .tracking(0.3)
+                            .foregroundColor(isCur ? Color(red: 248/255, green: 200/255, blue: 88/255) : vm.theme.dimColor.opacity(opacity))
+                            .shadow(color: Color.black.opacity(isCur ? 0.65 : 0.25), radius: 1.5, x: 0, y: 1.0)
+                            .scaleEffect(
+                                scale,
+                                anchor: line.alignment == .leading ? .leading : (line.alignment == .trailing ? .trailing : .center)
+                            )
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.35)
+                            .padding(.horizontal, 22)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                vm.seekToLine(time: line.time)
+                            }
+                    } else {
+                        Text(line.text.isEmpty ? "···" : line.text)
+                            // 关键：字号与字重（.semibold）全局恒定统一！绝对不在当前行/非当前行切换字重，彻底消除从粗体切换到细体时字符宽度突变引发的抽搐跳动！
+                            .font(.system(
+                                size: vm.mainFontSize,
+                                weight: .semibold,
+                                design: .rounded
+                            ))
+                            .tracking(0.3)
+                            .foregroundColor(isCur ? vm.theme.focusColor : vm.theme.dimColor.opacity(opacity))
+                            .shadow(color: Color.black.opacity(isCur ? 0.65 : 0.25), radius: 1.5, x: 0, y: 1.0)
+                            // 关键：纯 GPU 硬件纹理缩放，零 CPU 参与，彻底消除文字字距物理抖动！
+                            .scaleEffect(
+                                scale,
+                                anchor: line.alignment == .leading ? .leading : (line.alignment == .trailing ? .trailing : .center)
+                            )
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.35)
+                            .padding(.horizontal, 22)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                vm.seekToLine(time: line.time)
+                            }
+                    }
 
                     if line.alignment == .leading {
                         Spacer()
@@ -2680,6 +3231,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 } else if key == "o" {
                     self.chooseLocalMusicFolder()
                     return nil
+                } else if key == "y" {
+                    self.vm.toggleCantoneseSingMode()
+                    self.updateMenu()
+                    return nil
                 } else if key == "w" {
                     // 统一 ⌘W 处理逻辑：严格按当前活动窗口独立关闭，绝不连锁关闭！
                     if let localWin = LocalMusicWindowManager.shared.currentWindow, localWin.isKeyWindow {
@@ -2782,6 +3337,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(NSMenuItem(title: "双击折叠/展开单行模式", action: #selector(handleDoubleClick), keyEquivalent: "d"))
         menu.addItem(NSMenuItem.separator())
 
+        // 🗣️ 粤语学唱跟唱模式 (⌘Y)
+        let cantoneseMenu = NSMenu()
+        for mode in CantoneseSingMode.allCases {
+            let isSelected = (vm.cantoneseSingMode == mode)
+            let item = NSMenuItem(title: (isSelected ? "✓ " : "   ") + mode.displayName, action: #selector(changeCantoneseSingModeAction(_:)), keyEquivalent: "")
+            item.representedObject = mode.rawValue
+            cantoneseMenu.addItem(item)
+        }
+        let cantoneseParent = NSMenuItem(title: "🗣️ 粤语学唱跟唱模式 (⌘Y: \(vm.cantoneseSingMode.displayName))", action: nil, keyEquivalent: "")
+        cantoneseParent.submenu = cantoneseMenu
+        menu.addItem(cantoneseParent)
+
         // 🎨 字体颜色与氛围主题子菜单
         let themeMenu = NSMenu()
         for t in LyricTheme.allCases {
@@ -2829,6 +3396,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(NSMenuItem(title: "退出 SpotifyLyrics", action: #selector(quitApp), keyEquivalent: "q"))
 
         return menu
+    }
+
+    @objc func changeCantoneseSingModeAction(_ sender: NSMenuItem) {
+        if let raw = sender.representedObject as? String, let m = CantoneseSingMode(rawValue: raw) {
+            vm.setCantoneseSingMode(m)
+            updateMenu()
+        }
     }
 
     @objc func changeFontSizeAction(_ sender: NSMenuItem) {
